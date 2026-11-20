@@ -1,0 +1,7 @@
+.pdf2md-log {
+	max-height: 60vh;
+	overflow: auto;
+	white-space: pre-wrap;
+	font-size: var(--font-smaller);
+	user-select: text;
+}
