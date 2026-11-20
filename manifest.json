@@ -1,7 +1,7 @@
 {
 	"id": "pdf2md",
 	"name": "PDF to Markdown (Docling + Ollama)",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"minAppVersion": "1.4.0",
 	"description": "Convert PDFs to Obsidian Markdown locally with Docling and Ollama: LaTeX maths in $ and $$, figures, chapter splitting.",
 	"author": "jyothisable",

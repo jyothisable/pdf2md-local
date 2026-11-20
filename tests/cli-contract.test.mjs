@@ -24,6 +24,9 @@ test("flags emitted for every option combination exist in the tool", () => {
 		{ ...DEFAULT_SETTINGS, useLlm: false },
 		{ ...DEFAULT_SETTINGS, cleanMode: "all", inlineMath: "off" },
 		{ ...DEFAULT_SETTINGS, cleanMode: "none", inlineMath: "all", pagesPerBatch: 0 },
+		{ ...DEFAULT_SETTINGS, api: "openai", visionApi: "openai", visionHost: "http://h", pageLinks: "on", equationFlags: false },
+		{ ...DEFAULT_SETTINGS, engine: "paddleocr-vl", serveCommand: "serve.sh", splitChapters: true },
+		{ ...DEFAULT_SETTINGS, pageLinks: "off" },
 	];
 	for (const s of variants) {
 		for (const f of flagsIn(buildArgs("s.py", "a.pdf", s, "/out", "1-5"))) {
@@ -35,4 +38,9 @@ test("flags emitted for every option combination exist in the tool", () => {
 test("the tool accepts the option values the settings offer", () => {
 	for (const v of ["auto", "all", "none"]) assert.match(help, new RegExp(v));
 	for (const v of ["auto", "all", "off"]) assert.match(help, new RegExp(v));
+	for (const v of ["ollama", "openai", "docling", "paddleocr-vl", "on"]) assert.match(help, new RegExp(v));
+});
+
+test("the tool takes several PDFs", () => {
+	assert.match(help, /pdf \[pdf \.\.\.\]/);
 });

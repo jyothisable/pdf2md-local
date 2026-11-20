@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
 	DEFAULT_SETTINGS, splitArgs, buildArgs, parseLine, statusText, augmentedPath, toVaultPath, noteToOpen, clampInt,
+	apiBase, batchLabel, validPages, toolEnv,
 } from "../.test-build/runner.mjs";
 
 test("splitArgs honours quotes and empty input", () => {
@@ -80,4 +81,81 @@ test("toVaultPath and noteToOpen", () => {
 	assert.equal(toVaultPath("/v", "/vault2/a.md"), null);          // shares a prefix, is not inside
 	assert.equal(noteToOpen({ path: "Books/My Book", split: true }), "Books/My Book/00 Index.md");
 	assert.equal(noteToOpen({ path: "Books/a.md", split: false }), "Books/a.md");
+});
+
+test("buildArgs: several PDFs go before the options, in order", () => {
+	const a = buildArgs("/s.py", ["/v/a.pdf", "/v/b.pdf", "/v/c.pdf"], DEFAULT_SETTINGS, "/v/out");
+	assert.deepEqual(a.slice(3, 8), ["/s.py", "/v/a.pdf", "/v/b.pdf", "/v/c.pdf", "-o"]);
+	assert.equal(a[a.indexOf("-o") + 1], "/v/out");
+});
+
+test("buildArgs: an OpenAI-compatible server and an API key kept off the command line", () => {
+	const s = { ...DEFAULT_SETTINGS, api: "openai", ollamaHost: "http://localhost:8080", visionModel: "gemma", apiKey: "SECRET-KEY" };
+	const a = buildArgs("/s.py", "/v/a.pdf", s);
+	assert.equal(a[a.indexOf("--api") + 1], "openai");
+	assert.equal(a[a.indexOf("--host") + 1], "http://localhost:8080");
+	assert.ok(!a.join(" ").includes("SECRET-KEY"), "the API key must never be on the command line");
+});
+
+test("buildArgs: the PaddleOCR-VL engine passes the server and nothing about models", () => {
+	const s = { ...DEFAULT_SETTINGS, engine: "paddleocr-vl", paddleServer: " http://127.0.0.1:8111/v1 ", serveCommand: " /x/serve.sh ", splitChapters: true };
+	const a = buildArgs("/s.py", "/v/a.pdf", s, undefined, "5-9");
+	assert.equal(a[a.indexOf("--engine") + 1], "paddleocr-vl");
+	assert.equal(a[a.indexOf("--paddle-server") + 1], "http://127.0.0.1:8111/v1");
+	assert.equal(a[a.indexOf("--serve-command") + 1], "/x/serve.sh");
+	assert.ok(a.includes("--split-chapters") && a.includes("--page-links"));
+	assert.equal(a[a.indexOf("--pages") + 1], "5-9");
+	for (const f of ["--model", "--host", "--jobs", "--api", "--clean", "--inline-math", "--vision-model", "--pages-per-batch", "--no-llm", "--no-equation-flags"]) {
+		assert.ok(!a.includes(f), `${f} makes no sense for the PaddleOCR-VL engine`);
+	}
+	const bare = buildArgs("/s.py", "/v/a.pdf", { ...DEFAULT_SETTINGS, engine: "paddleocr-vl", paddleServer: " " });
+	assert.equal(bare[bare.indexOf("--paddle-server") + 1], "http://127.0.0.1:8111/v1");   // empty falls back to the default
+	assert.ok(!bare.includes("--serve-command"));
+});
+
+test("buildArgs: separate vision server, page links and equation flags", () => {
+	const s = { ...DEFAULT_SETTINGS, visionApi: "openai", visionHost: " http://localhost:8080 ", pageLinks: "off", equationFlags: false };
+	const a = buildArgs("/s.py", "/v/a.pdf", s);
+	assert.equal(a[a.indexOf("--vision-api") + 1], "openai");
+	assert.equal(a[a.indexOf("--vision-host") + 1], "http://localhost:8080");
+	assert.equal(a[a.indexOf("--page-links") + 1], "off");
+	assert.ok(a.includes("--no-equation-flags"));
+	const d = buildArgs("/s.py", "/v/a.pdf", DEFAULT_SETTINGS);
+	assert.ok(!d.includes("--vision-api") && !d.includes("--vision-host") && !d.includes("--no-equation-flags") && !d.includes("--engine"));
+	assert.equal(d[d.indexOf("--clean") + 1], "auto");
+	const noVision = buildArgs("/s.py", "/v/a.pdf", { ...s, useVision: false });
+	assert.ok(noVision.includes("--no-vision") && !noVision.includes("--vision-model"));
+});
+
+test("parseLine and statusText understand batches", () => {
+	assert.deepEqual(parseLine("=== PDF 2/5: Some Book (2020).pdf"), { kind: "pdf", n: 2, total: 5, name: "Some Book (2020).pdf" });
+	assert.equal(statusText({ kind: "pdf", n: 2, total: 5, name: "x" }), "PDF→MD: PDF 2/5");
+	assert.equal(statusText({ kind: "slice", n: 3, total: 14, etaMin: 9 }, "PDF 2/5"), "PDF→MD: PDF 2/5 · slice 3/14 · ~9 min left");
+	assert.equal(batchLabel({ kind: "pdf", n: 2, total: 5, name: "x" }), "PDF 2/5");
+	assert.equal(batchLabel({ kind: "pdf", n: 1, total: 1, name: "x" }), "");
+	assert.equal(batchLabel(null), "");
+	assert.equal(batchLabel({ kind: "other" }), "");
+});
+
+test("apiBase mirrors the tool's rule", () => {
+	assert.equal(apiBase("http://localhost:8080"), "http://localhost:8080/v1");
+	assert.equal(apiBase(" http://localhost:8080/ "), "http://localhost:8080/v1");
+	assert.equal(apiBase("http://localhost:8080/v1/"), "http://localhost:8080/v1");
+	assert.equal(apiBase("https://openrouter.ai/api/v1"), "https://openrouter.ai/api/v1");
+	assert.equal(apiBase("not a url"), "not a url");
+});
+
+test("validPages accepts the tool's page-range syntax only", () => {
+	for (const ok of ["", "  ", "7", "10-40", " 3 - 9 "]) assert.ok(validPages(ok), ok);
+	for (const bad of ["0", "0-4", "9-3", "a", "1-", "-5", "1,2", "1-2-3"]) assert.ok(!validPages(bad), bad);
+});
+
+test("toolEnv adds PATH and the key without losing the rest", () => {
+	const e = toolEnv({ PATH: "/usr/bin", HOME: "/h", EMPTY: undefined }, "/h", " k ");
+	assert.equal(e.PDF2MD_API_KEY, "k");
+	assert.equal(e.HOME, "/h");
+	assert.ok(e.PATH.includes("/h/.local/bin") && e.PATH.startsWith("/usr/bin"));
+	assert.equal(e.PYTHONUNBUFFERED, "1");
+	assert.ok(!("EMPTY" in e));
+	assert.ok(!("PDF2MD_API_KEY" in toolEnv({}, "/h", "  ")));
 });

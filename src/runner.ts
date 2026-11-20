@@ -2,11 +2,34 @@
 
 export type CleanMode = "auto" | "all" | "none";
 export type InlineMode = "auto" | "all" | "off";
+export type Api = "ollama" | "openai";
+export type Engine = "docling" | "paddleocr-vl";
+export type PageLinks = "auto" | "on" | "off";
 
 export interface Settings {
 	/** Path or name of the `uv` executable. */
 	uvPath: string;
+	/** ollama, or openai = any OpenAI-compatible server (llama.cpp's llama-server, LM Studio, vLLM ...). */
+	api: Api;
+	/** Address of the model server. For openai a bare host:port gets /v1 added by the tool. */
 	ollamaHost: string;
+	/** Passed to the tool through the environment (never on the command line). */
+	apiKey: string;
+	/** Empty = same API as the text model. */
+	visionApi: "" | Api;
+	/** Empty = same address as the text model. */
+	visionHost: string;
+	/** docling = Docling layout + a vision model repairing equations; paddleocr-vl = PaddleOCR-VL-1.6 via llama.cpp. */
+	engine: Engine;
+	/** The llama-server running PaddleOCR-VL (engine paddleocr-vl). */
+	paddleServer: string;
+	/** Command that starts that server if nothing answers; the tool stops it again when done. */
+	serveCommand: string;
+	pageLinks: PageLinks;
+	/** Add "check this equation" callouts for equations that look cut off. */
+	equationFlags: boolean;
+	/** Ask which pages to convert before every single-PDF conversion. */
+	askForPages: boolean;
 	textModel: string;
 	/** Empty = use the text model for vision too. */
 	visionModel: string;
@@ -29,7 +52,17 @@ export interface Settings {
 
 export const DEFAULT_SETTINGS: Settings = {
 	uvPath: "uv",
+	api: "ollama",
 	ollamaHost: "http://localhost:11434",
+	apiKey: "",
+	visionApi: "",
+	visionHost: "",
+	engine: "docling",
+	paddleServer: "http://127.0.0.1:8111/v1",
+	serveCommand: "",
+	pageLinks: "auto",
+	equationFlags: true,
+	askForPages: false,
 	textModel: "gemma4:12b",
 	visionModel: "",
 	jobs: 3,
@@ -70,18 +103,32 @@ export function splitArgs(text: string): string[] {
 }
 
 /** Arguments for `uv`, running the bundled script on one PDF. */
-export function buildArgs(script: string, pdfAbs: string, s: Settings, outAbs?: string, pages?: string): string[] {
-	const args = ["run", "--python", "3.12", script, pdfAbs];
+export function buildArgs(script: string, pdfAbs: string | string[], s: Settings, outAbs?: string, pages?: string): string[] {
+	const pdfs = Array.isArray(pdfAbs) ? pdfAbs : [pdfAbs];
+	const args = ["run", "--python", "3.12", script, ...pdfs];
 	if (outAbs) args.push("-o", outAbs);
-	if (!s.useLlm) {
-		args.push("--no-llm");
+	if (s.engine === "paddleocr-vl") {
+		// PaddleOCR-VL reads the pages itself: no model flags, and the tool picks its own (larger) slice size
+		args.push("--engine", "paddleocr-vl", "--paddle-server", s.paddleServer.trim() || DEFAULT_SETTINGS.paddleServer);
+		if (s.serveCommand.trim()) args.push("--serve-command", s.serveCommand.trim());
 	} else {
-		args.push("--model", s.textModel, "--host", s.ollamaHost, "--jobs", String(clampInt(s.jobs, 1, 16)));
-		args.push("--clean", s.cleanMode, "--inline-math", s.inlineMath);
-		if (!s.useVision) args.push("--no-vision");
-		else if (s.visionModel.trim()) args.push("--vision-model", s.visionModel.trim());
+		if (!s.useLlm) {
+			args.push("--no-llm");
+		} else {
+			args.push("--model", s.textModel, "--host", s.ollamaHost, "--jobs", String(clampInt(s.jobs, 1, 16)));
+			args.push("--api", s.api, "--inline-math", s.inlineMath, "--clean", s.cleanMode);
+			if (!s.useVision) {
+				args.push("--no-vision");
+			} else {
+				if (s.visionModel.trim()) args.push("--vision-model", s.visionModel.trim());
+				if (s.visionApi) args.push("--vision-api", s.visionApi);
+				if (s.visionHost.trim()) args.push("--vision-host", s.visionHost.trim());
+			}
+		}
+		args.push("--pages-per-batch", String(clampInt(s.pagesPerBatch, 0, 500)));
+		if (!s.equationFlags) args.push("--no-equation-flags");
 	}
-	args.push("--pages-per-batch", String(clampInt(s.pagesPerBatch, 0, 500)));
+	args.push("--page-links", s.pageLinks);
 	if (s.splitChapters) args.push("--split-chapters");
 	if (pages && pages.trim()) args.push("--pages", pages.trim());
 	args.push(...splitArgs(s.extraArgs));
@@ -94,6 +141,7 @@ export function clampInt(v: number, lo: number, hi: number): number {
 }
 
 export type Progress =
+	| { kind: "pdf"; n: number; total: number; name: string }
 	| { kind: "slice"; n: number; total: number; etaMin?: number }
 	| { kind: "cleaning"; done: number; total: number }
 	| { kind: "stage"; stage: number; text: string }
@@ -104,7 +152,9 @@ export type Progress =
 /** Interpret one line of the tool's output. */
 export function parseLine(line: string): Progress {
 	const l = line.trim();
-	let m = /^slice (\d+)\/(\d+)/.exec(l);
+	let m = /^=== PDF (\d+)\/(\d+): (.+)$/.exec(l);
+	if (m) return { kind: "pdf", n: +m[1], total: +m[2], name: m[3] };
+	m = /^slice (\d+)\/(\d+)/.exec(l);
 	if (m) {
 		const eta = /ETA ~(\d+) min/.exec(l);
 		return { kind: "slice", n: +m[1], total: +m[2], etaMin: eta ? +eta[1] : undefined };
@@ -121,15 +171,18 @@ export function parseLine(line: string): Progress {
 	return { kind: "other" };
 }
 
-/** Short text for the status bar. */
-export function statusText(p: Progress): string | null {
+/** Short text for the status bar. `batch` is the current "PDF 2/5" prefix, if several PDFs are running. */
+export function statusText(p: Progress, batch = ""): string | null {
+	const pre = batch ? `${batch} · ` : "";
 	switch (p.kind) {
+		case "pdf":
+			return `PDF→MD: PDF ${p.n}/${p.total}`;
 		case "slice":
-			return `PDF→MD: slice ${p.n}/${p.total}` + (p.etaMin !== undefined ? ` · ~${p.etaMin} min left` : "");
+			return `PDF→MD: ${pre}slice ${p.n}/${p.total}` + (p.etaMin !== undefined ? ` · ~${p.etaMin} min left` : "");
 		case "cleaning":
-			return `PDF→MD: cleaning ${p.done}/${p.total}`;
+			return `PDF→MD: ${pre}cleaning ${p.done}/${p.total}`;
 		case "stage":
-			return `PDF→MD: step ${p.stage}/4`;
+			return `PDF→MD: ${pre}step ${p.stage}/4`;
 		default:
 			return null;
 	}
@@ -155,4 +208,39 @@ export function toVaultPath(base: string, abs: string): string | null {
 /** The note to open after a conversion: the index for a split book, the note itself otherwise. */
 export function noteToOpen(w: { path: string; split: boolean }): string {
 	return w.split ? `${w.path.replace(/\/+$/, "")}/00 Index.md` : w.path;
+}
+
+/** Base URL of an OpenAI-compatible server, as the tool computes it: a bare host:port gets /v1. */
+export function apiBase(host: string): string {
+	const h = host.trim().replace(/\/+$/, "");
+	let path = "";
+	try {
+		path = new URL(h).pathname;
+	} catch {
+		return h;
+	}
+	return path === "" || path === "/" ? `${h}/v1` : h;
+}
+
+/** Short status for a batch: "PDF 2/5", or empty for a single file. */
+export function batchLabel(p: Progress | null): string {
+	return p && p.kind === "pdf" && p.total > 1 ? `PDF ${p.n}/${p.total}` : "";
+}
+
+/** Valid page-range text: empty (all pages), "7", or "10-40". */
+export function validPages(text: string): boolean {
+	const t = text.trim();
+	if (!t) return true;
+	const m = /^(\d+)(?:\s*-\s*(\d+))?$/.exec(t);
+	return !!m && +m[1] >= 1 && (m[2] === undefined || +m[2] >= +m[1]);
+}
+
+/** Environment for the tool: PATH extended for uv, and the API key (never put on the command line). */
+export function toolEnv(env: Record<string, string | undefined>, home: string, apiKey: string, sep = ":"): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [k, v] of Object.entries(env)) if (v !== undefined) out[k] = v;
+	out.PATH = augmentedPath(env, home, sep);
+	out.PYTHONUNBUFFERED = "1";
+	if (apiKey.trim()) out.PDF2MD_API_KEY = apiKey.trim();
+	return out;
 }

@@ -883,5 +883,420 @@ class BackupHookTests(unittest.TestCase):
                 m.main()
 
 
+class OpenAiBackendTests(unittest.TestCase):
+    def capture(self, fn):
+        import io
+        import json as _json
+        from unittest import mock
+        sent = {}
+
+        def fake_urlopen(req, timeout=None):
+            sent["url"] = req.full_url
+            sent["headers"] = {k.lower(): v for k, v in req.header_items()}
+            sent["body"] = _json.loads(req.data) if req.data else None
+            return io.BytesIO(_json.dumps({"choices": [{"message": {"content": "reply"}}]}).encode())
+
+        with mock.patch.object(m.urllib.request, "urlopen", fake_urlopen):
+            self.assertEqual(fn(), "reply")
+        return sent
+
+    def test_api_base(self):
+        self.assertEqual(m.api_base("http://localhost:8080"), "http://localhost:8080/v1")
+        self.assertEqual(m.api_base("http://localhost:8080/"), "http://localhost:8080/v1")
+        self.assertEqual(m.api_base("http://localhost:8080/v1/"), "http://localhost:8080/v1")
+        self.assertEqual(m.api_base("https://openrouter.ai/api/v1"), "https://openrouter.ai/api/v1")
+
+    def test_request_shape(self):
+        sent = self.capture(lambda: m.openai_chat("http://h:8080", "mod", "sys", "usr", 5, [b"png"], 700, "KEY"))
+        self.assertEqual(sent["url"], "http://h:8080/v1/chat/completions")
+        self.assertEqual(sent["headers"]["authorization"], "Bearer KEY")
+        b = sent["body"]
+        self.assertEqual((b["model"], b["temperature"], b["max_tokens"], b["stream"]), ("mod", 0, 700, False))
+        self.assertEqual(b["messages"][0], {"role": "system", "content": "sys"})
+        content = b["messages"][1]["content"]
+        self.assertEqual([c["type"] for c in content], ["text", "image_url"])     # text first by default
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+    def test_backend_dispatch_and_check(self):
+        from unittest import mock
+        calls = []
+        with mock.patch.object(m, "ollama_chat", lambda *a, **k: calls.append(("ollama", a)) or "o"), \
+             mock.patch.object(m, "openai_chat", lambda *a, **k: calls.append(("openai", a)) or "p"):
+            self.assertEqual(m.Backend("ollama", "h", "m").chat("s", "u", 5), "o")
+            self.assertEqual(m.Backend("openai", "h", "m").chat("s", "u", 5), "p")
+        self.assertEqual([c[0] for c in calls], ["ollama", "openai"])
+        self.assertEqual(m.Backend("openai", "h", "m").describe(), "openai:m")
+
+        def refuse(req, timeout=None):
+            raise urllib.error.URLError("refused")
+
+        with mock.patch.object(m.urllib.request, "urlopen", refuse):
+            with self.assertRaises(SystemExit):
+                m.Backend("openai", "http://nowhere", "m").check()
+
+        def not_found(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 404, "nf", {}, None)
+
+        with mock.patch.object(m.urllib.request, "urlopen", not_found):
+            m.Backend("openai", "http://h", "m").check()                  # a server that answers 404 on /models is fine
+
+
+class PageLinkAndDoubtTests(unittest.TestCase):
+    def test_link_target(self):
+        self.assertEqual(m.link_target("Book.pdf", 12), "[[Book.pdf#page=12|p. 12]]")
+        self.assertEqual(m.link_target("A Big Book (2020).pdf", 3), "[[A Big Book (2020).pdf#page=3|p. 3]]")
+        for bad in ("a[b].pdf", "a|b.pdf", "a#b.pdf", "a^b.pdf", ""):
+            self.assertIsNone(m.link_target(bad, 1), bad)
+
+    def test_which_headings_get_links(self):
+        self.assertTrue(m.wants_page_link("2.1 Supervised learning", 2))
+        self.assertTrue(m.wants_page_link("Introduction", None))
+        self.assertFalse(m.wants_page_link("Chapter 7", 1))                   # merged with its title later
+        self.assertFalse(m.wants_page_link("Figure 3.9 A diagram", 2))
+        self.assertFalse(m.wants_page_link("2 Vectors and matrices 18", 1))   # table-of-contents line
+        self.assertFalse(m.wants_page_link("x = torch.tensor([1, 2])", 1))     # code comment
+        self.assertFalse(m.wants_page_link("A deep subsection", 4))           # too deep
+        self.assertFalse(m.wants_page_link("K", 2))
+
+    def test_equation_doubt(self):
+        self.assertIsNone(m.equation_doubt(r"y = \frac{a}{b} + c", 120))
+        self.assertIsNone(m.equation_doubt(r"\begin{aligned} a &= b \\ c &= d \end{aligned}", 150))
+        self.assertIsNone(m.equation_doubt(r"E = mc^{2} \tag{1}", 120))
+        self.assertIsNone(m.equation_doubt(r"x = y,", 60))                    # trailing punctuation is normal
+        self.assertIn("operator", m.equation_doubt(r"V[X] = \sum_i a_i +", 200))
+        self.assertIn("operator", m.equation_doubt(r"a = b \cdot", None))
+        self.assertIn("operator", m.equation_doubt(r"\begin{aligned} a &= b - \\ \end{aligned}", None))
+        self.assertIn("empty group", m.equation_doubt(r"x^{} + y", None))
+        self.assertIn("empty group", m.equation_doubt(r"\frac{}{2}", None))
+        self.assertIn("short", m.equation_doubt("x", 400))                    # one symbol in a 400-point-wide picture
+        self.assertEqual(m.equation_doubt(r"\tag{3}", None), "empty")
+
+    def test_flag_equation_writes_the_picture_and_a_collapsed_callout(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = m.flag_equation(r"a = b +", "ends in an operator", b"PNG", 41, "Book.pdf", Path(d) / "assets")
+            name = re.search(r"!\[\[(equation_[0-9a-f]{12}\.png)\]\]", out).group(1)
+            self.assertEqual((Path(d) / "assets" / name).read_bytes(), b"PNG")
+            self.assertTrue(out.startswith("$$a = b +$$\n\n> [!warning]- Check this equation against the PDF (ends in an operator)\n"))
+            self.assertIn("> [[Book.pdf#page=41|p. 41]]", out)
+            nolink = m.flag_equation("x", "w", b"P2", None, "a[b].pdf", Path(d))
+            self.assertNotIn("#page=", nolink)
+
+    def test_flagged_equation_survives_the_pipeline(self):
+        swapped = m.apply_swaps("t\n\n$$PDFMDFORMULA0X$$\n\nafter", {"PDFMDFORMULA0X": "$$a = b +$$\n\n> [!warning]- Check\n> ![[equation_x.png]]\n"})
+        final = m.normalize_math(swapped)
+        self.assertIn("$$\na = b +\n$$", final)
+        self.assertIn("> [!warning]- Check\n> ![[equation_x.png]]", final)
+        self.assertEqual(m.validate_document(final), [])
+
+
+class BatchAndBackendMainTests(unittest.TestCase):
+    def run_main(self, d, argv, convert=None):
+        from unittest import mock
+        seen = {"slices": [], "checks": []}
+
+        def fake_convert(conv, pdf_, rng, assets, pool, ask_latex, ask_fig, ask_inline, mode, ask_retry, page_links, flag_doubt):
+            seen["slices"].append((pdf_.name, ask_latex, ask_fig, ask_inline, ask_retry, page_links, flag_doubt))
+            if convert:
+                return convert(pdf_)
+            return "text\n", m.new_stats()
+
+        with mock.patch.object(m, "make_converter", lambda *a, **k: object()), \
+             mock.patch.object(m, "convert_slice", fake_convert), \
+             mock.patch.object(m, "page_count", lambda p: 2), \
+             mock.patch.object(m.Backend, "check", lambda self: seen["checks"].append(self.describe())), \
+             mock.patch.object(m, "CACHE_ROOT", Path(d) / "cache"), \
+             mock.patch.object(sys, "argv", ["pdf_to_md", *argv]):
+            m.main()
+        return seen
+
+    def test_several_pdfs_are_converted_in_turn(self):
+        with tempfile.TemporaryDirectory() as d:
+            for n in ("a", "b", "c"):
+                (Path(d) / f"{n}.pdf").write_bytes(b"%PDF-1.4 fake")
+            seen = self.run_main(d, [str(Path(d) / f"{n}.pdf") for n in "abc"] + ["--no-llm", "--no-backup", "-o", str(Path(d) / "out")])
+            self.assertEqual([s[0] for s in seen["slices"]], ["a.pdf", "b.pdf", "c.pdf"])
+            self.assertEqual(sorted(p.name for p in (Path(d) / "out").glob("*.md")), ["a.md", "b.md", "c.md"])
+
+    def test_one_failure_does_not_stop_the_batch_but_is_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            for n in ("a", "b"):
+                (Path(d) / f"{n}.pdf").write_bytes(b"%PDF-1.4 fake")
+
+            def convert(pdf_):
+                if pdf_.name == "a.pdf":
+                    sys.exit("boom")
+                return "ok\n", m.new_stats()
+
+            with self.assertRaises(SystemExit) as cm:
+                self.run_main(d, [str(Path(d) / "a.pdf"), str(Path(d) / "b.pdf"), "--no-llm", "--no-backup"], convert)
+            self.assertIn("1 of 2 PDF(s) failed", str(cm.exception.code))
+            self.assertTrue((Path(d) / "b.md").exists())                          # the second one still ran
+
+    def test_batch_needs_a_folder_for_output_and_valid_pdfs(self):
+        with tempfile.TemporaryDirectory() as d:
+            for n in ("a", "b"):
+                (Path(d) / f"{n}.pdf").write_bytes(b"%PDF-1.4 fake")
+            with self.assertRaises(SystemExit) as cm:
+                self.run_main(d, [str(Path(d) / "a.pdf"), str(Path(d) / "b.pdf"), "--no-llm", "-o", str(Path(d) / "x.md")])
+            self.assertIn("folder", str(cm.exception.code))
+            with self.assertRaises(SystemExit) as cm:
+                self.run_main(d, [str(Path(d) / "a.pdf"), str(Path(d) / "missing.pdf"), "--no-llm"])
+            self.assertIn("not a PDF file", str(cm.exception.code))
+
+    def test_chat_style_with_ollama_checks_both_models_and_keeps_captions(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "a.pdf").write_bytes(b"%PDF-1.4 fake")
+            seen = self.run_main(d, [str(Path(d) / "a.pdf"), "--vision-model", "qwen3-vl:8b", "--no-backup"])
+            self.assertEqual(seen["checks"], ["ollama:gemma4:12b", "ollama:qwen3-vl:8b"])
+            _, ask_latex, ask_fig, ask_inline, ask_retry, page_links, flag_doubt = seen["slices"][0]
+            self.assertTrue(all(callable(f) for f in (ask_latex, ask_fig, ask_inline, ask_retry)))
+            self.assertFalse(page_links)                                          # the PDF is not inside a vault
+            self.assertTrue(flag_doubt)
+
+    def test_page_links_follow_the_vault_and_the_flag(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / ".obsidian").mkdir()
+            (Path(d) / "a.pdf").write_bytes(b"%PDF-1.4 fake")
+            self.assertTrue(self.run_main(d, [str(Path(d) / "a.pdf"), "--no-llm", "--no-backup"])["slices"][0][5])
+            (Path(d) / "a.md").unlink()
+            self.assertFalse(self.run_main(d, [str(Path(d) / "a.pdf"), "--no-llm", "--no-backup", "--page-links", "off"])["slices"][0][5])
+            (Path(d) / "a.md").unlink()
+            self.assertFalse(self.run_main(d, [str(Path(d) / "a.pdf"), "--no-llm", "--no-backup", "--no-equation-flags"])["slices"][0][6])
+
+
+class PaddleMarkdownTests(unittest.TestCase):
+    TABLE = ("<table border=1 style='margin: auto;'><tr><td style='text-align: center;'>Type</td><td>Fall</td></tr>"
+             "<tr><td>Domestic | US</td><td>Jan<br>15</td></tr></table>")
+
+    def test_simple_table_becomes_markdown(self):
+        out = m.html_table_to_md(self.TABLE)
+        self.assertEqual(out.split("\n"), ["| Type | Fall |", "| --- | --- |", "| Domestic \\| US | Jan 15 |"])
+
+    def test_merged_cells_are_left_as_html_and_ragged_rows_padded(self):
+        self.assertIsNone(m.html_table_to_md("<table><tr><td colspan='2'>A</td></tr><tr><td>b</td><td>c</td></tr></table>"))
+        self.assertIsNone(m.html_table_to_md("<table><tr><td rowspan=\"2\">A</td><td>x</td></tr></table>"))
+        self.assertIsNone(m.html_table_to_md("<p>no table</p>"))
+        ragged = m.html_table_to_md("<table><tr><td>a</td><td>b</td></tr><tr><td>c</td></tr></table>")
+        self.assertEqual(ragged.split("\n")[-1], "| c |  |")
+        self.assertIsNotNone(m.html_table_to_md("<table><tr><td colspan='1'>a</td></tr></table>"))   # colspan=1 is not merged
+
+    def test_page_markdown_is_cleaned(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "page_0011"
+            (src / "imgs").mkdir(parents=True)
+            (src / "imgs" / "box_1.jpg").write_bytes(b"jpg")
+            md = ('<div style="text-align: center;"><img src="imgs/box_1.jpg" alt="Image" width="54%" /></div>\n\n'
+                  '<div style="text-align: center;">FIGURE 12. Two  $ \\sharp $-moves convert  $ T $.</div>\n\n'
+                  '## 4.3 Slice genus\n\nA  sentence  with gaps.\n\n' + self.TABLE + '\n\n<img src="imgs/missing.jpg" />\n')
+            out = m.clean_paddle_markdown(md, 11, src, Path(d) / "assets", "[[B.pdf#page=11|p. 11]]")
+            self.assertIn("![[p0011_box_1.jpg]]", out)
+            self.assertEqual((Path(d) / "assets" / "p0011_box_1.jpg").read_bytes(), b"jpg")
+            self.assertNotIn("<div", out)
+            self.assertNotIn("<img", out)                                   # the unresolvable one is dropped
+            self.assertIn("FIGURE 12. Two $ \\sharp $-moves convert $ T $.", out)   # spacing collapsed, maths untouched
+            self.assertIn("## 4.3 Slice genus\n\n[[B.pdf#page=11|p. 11]]\n\nA sentence with gaps.", out)
+            self.assertIn("| Type | Fall |", out)
+            self.assertNotIn("<table", out)
+
+    def test_tables_code_and_unlinkable_headings_are_left_alone(self):
+        out = m.clean_paddle_markdown("# Title\n\n```\na   b\n```\n\n| a   b | c |\n| --- | --- |\n\n## Figure 3 caption", 2, None, None,
+                                      "[[B.pdf#page=2|p. 2]]")
+        self.assertIn("a   b\n```", out)                                   # code keeps its spaces
+        self.assertIn("| a   b | c |", out)                                 # so do table rows
+        self.assertEqual(out.count("[[B.pdf#page=2|p. 2]]"), 1)             # "Figure 3 caption" is not a heading
+        self.assertEqual(m.clean_paddle_markdown("# T\n", 1, None, None, None), "# T\n")   # no link when none given
+
+    def test_paddle_output_flows_through_the_math_pipeline(self):
+        raw = ("Consider $ \\sigma(K)=0 $ and\n\n $$ \\sigma(K)+4\\cdot A r f(K)\\equiv0~{o r}~\\pm2 $$ \n\n $$ G_{F}(K)=\\begin{bmatrix}l&m\\\\ m&n\\end{bmatrix} $$ \n")
+        final = m.normalize_math(m.clean_paddle_markdown(raw, 1, None, None))
+        self.assertIn("Consider $\\sigma(K)=0$ and", final)                # inline spaces trimmed
+        self.assertIn("$$\nG_{F}(K)=\\begin{bmatrix}l&m\\\\ m&n\\end{bmatrix}\n$$", final)
+        self.assertIn("Arf(K)", final)                                      # letter-spaced words rejoined in display maths only
+        self.assertEqual(m.validate_document(final), [])
+
+
+class ServerGuardTests(unittest.TestCase):
+    def serve(self):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return f"http://127.0.0.1:{srv.server_address[1]}"
+
+    def free_port(self):
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def test_a_running_server_is_used_and_never_started_or_stopped(self):
+        url = self.serve()
+        with m.ServerGuard(url, "definitely-not-a-command", 5) as g:
+            self.assertIsNone(g.proc)
+        self.assertTrue(g.alive())                                          # still up after the guard
+
+    def test_missing_server_without_a_command_explains_how_to_start_one(self):
+        with self.assertRaises(SystemExit) as cm:
+            m.ServerGuard(f"http://127.0.0.1:{self.free_port()}", None, 5).__enter__()
+        self.assertIn("llama-server", str(cm.exception.code))
+        self.assertIn("--serve-command", str(cm.exception.code))
+
+    def test_command_starts_the_server_and_is_stopped_afterwards(self):
+        port = self.free_port()
+        code = ("import http.server\n"
+                "class H(http.server.BaseHTTPRequestHandler):\n"
+                "    def do_GET(self):\n        self.send_response(200); self.end_headers(); self.wfile.write(b'{}')\n"
+                "    def log_message(self, *a): pass\n"
+                f"http.server.HTTPServer(('127.0.0.1', {port}), H).serve_forever()\n")
+        cmd = f"{sys.executable} -c \"{code}\""
+        import shlex
+        guard = m.ServerGuard(f"http://127.0.0.1:{port}", " ".join(shlex.quote(a) for a in [sys.executable, "-c", code]), 30)
+        with guard:
+            self.assertIsNotNone(guard.proc)
+            self.assertTrue(guard.alive())
+            pid = guard.proc.pid
+        self.assertIsNone(guard.proc)
+        import time
+        for _ in range(50):
+            if not guard.alive():
+                break
+            time.sleep(0.1)
+        self.assertFalse(guard.alive())                                     # we stopped what we started
+
+    def test_a_command_that_dies_or_never_answers_is_reported(self):
+        with self.assertRaises(SystemExit) as cm:
+            m.ServerGuard(f"http://127.0.0.1:{self.free_port()}", f"{sys.executable} -c \"import sys; sys.exit(3)\"", 10).__enter__()
+        self.assertIn("exited (code 3)", str(cm.exception.code))
+        with self.assertRaises(SystemExit) as cm:
+            m.ServerGuard(f"http://127.0.0.1:{self.free_port()}", f"{sys.executable} -c \"import time; time.sleep(30)\"", 2).__enter__()
+        self.assertIn("did not become ready", str(cm.exception.code))
+
+
+class PaddleSliceTests(unittest.TestCase):
+    def fake_worker(self, d, body):
+        f = Path(d) / "fake_worker.py"
+        f.write_text(body)
+        return lambda pdf, rng, server, out: [sys.executable, str(f), str(out), str(rng[0]), str(rng[1]), server]
+
+    WORKER = (
+        "import sys\nfrom pathlib import Path\n"
+        "out, first, last = Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])\n"
+        "for p in range(first, last + 1):\n"
+        "    if p == 3:\n        print('ERROR page 3: boom', flush=True); continue\n"
+        "    d = out / f'page_{p:04d}'; (d / 'imgs').mkdir(parents=True)\n"
+        "    (d / 'imgs' / 'a.jpg').write_bytes(b'x')\n"
+        "    (d / 'doc.md').write_text(f'# Part {chr(64 + p)}\\n\\nText on page {p}. $ x $\\n\\n<img src=\"imgs/a.jpg\" />\\n\\n$$ y $$\\n')\n"
+        "    print(f'PAGE {p - first + 1}/{last - first + 1}', flush=True)\n")
+
+    def test_pages_are_joined_cleaned_and_bad_pages_marked(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(m, "worker_command", self.fake_worker(d, self.WORKER)):
+                md, st = m.paddle_slice(Path(d) / "My Book.pdf", (1, 4), Path(d) / "assets", "http://s/v1", True)
+            self.assertLess(md.index("Text on page 1"), md.index("Text on page 2"))
+            self.assertLess(md.index("Text on page 2"), md.index("Text on page 4"))
+            self.assertIn("<!-- page 3 could not be read -->", md)
+            self.assertNotIn("Text on page 3", md)
+            self.assertIn("# Part B\n\n[[My Book.pdf#page=2|p. 2]]", md)
+            self.assertEqual(sorted(p.name for p in (Path(d) / "assets").iterdir()), ["p0001_a.jpg", "p0002_a.jpg", "p0004_a.jpg"])
+            self.assertIn("![[p0004_a.jpg]]", md)
+            self.assertEqual(st["eq_total"], 3)
+
+    def test_no_links_when_not_wanted_and_total_failure_raises(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(m, "worker_command", self.fake_worker(d, self.WORKER)):
+                md, _ = m.paddle_slice(Path(d) / "b.pdf", (1, 2), Path(d) / "assets", "http://s/v1", False)
+            self.assertNotIn("#page=", md)
+            dead = "import sys; sys.exit(7)\n"
+            with mock.patch.object(m, "worker_command", self.fake_worker(d, dead)):
+                with self.assertRaises(RuntimeError):
+                    m.paddle_slice(Path(d) / "b.pdf", (1, 2), Path(d) / "assets2", "http://s/v1", False)
+
+    def test_worker_command_uses_the_bundled_script(self):
+        cmd = m.worker_command(Path("/x/a.pdf"), (5, 9), "http://s/v1", Path("/o"))
+        self.assertEqual(cmd[:4], ["uv", "run", "--python", "3.12"])
+        self.assertTrue(cmd[4].endswith("paddle_worker.py") and Path(cmd[4]).exists())
+        self.assertEqual(cmd[cmd.index("--first") + 1:cmd.index("--first") + 4], ["5", "--last", "9"])
+
+
+class PaddleEngineMainTests(unittest.TestCase):
+    def run_main(self, d, argv, md="# 1 One\n\ntext $ x $\n"):
+        from unittest import mock
+        seen = {"slices": [], "checks": [], "guards": []}
+
+        class FakeGuard:
+            def __init__(self, url, command, wait):
+                seen["guards"].append((url, command, wait))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                seen["guards"].append("exit")
+
+        def fake_slice(pdf, rng, assets, server, page_links):
+            seen["slices"].append((rng, server, page_links))
+            return md, m.new_stats()
+
+        with mock.patch.object(m, "paddle_slice", fake_slice), mock.patch.object(m, "ServerGuard", FakeGuard), \
+             mock.patch.object(m, "make_converter", lambda *a, **k: self.fail("Docling must not load")), \
+             mock.patch.object(m, "page_count", lambda p: 300), \
+             mock.patch.object(m.Backend, "check", lambda self: seen["checks"].append(self.describe())), \
+             mock.patch.object(m, "CACHE_ROOT", Path(d) / "cache"), \
+             mock.patch.object(sys, "argv", ["pdf_to_md", *argv]):
+            m.main()
+        return seen
+
+    def test_engine_needs_no_model_backend_and_uses_big_slices(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "a.pdf").write_bytes(b"%PDF-1.4 fake")
+            seen = self.run_main(d, [str(Path(d) / "a.pdf"), "--engine", "paddleocr-vl", "--paddle-server", "http://h:9/v1",
+                                     "--serve-command", "start-it", "--serve-wait", "7", "--no-backup"])
+            self.assertEqual([s[0] for s in seen["slices"]], [(1, 120), (121, 240), (241, 300)])
+            self.assertEqual(seen["checks"], [])                              # no Ollama, no text or vision server
+            self.assertEqual(seen["guards"], [("http://h:9/v1", "start-it", 7), "exit"])   # started, then stopped
+            text = (Path(d) / "a.md").read_text()
+            self.assertIn("converter: paddleocr-vl-1.6", text)
+            self.assertIn("text $x$", text)                                   # maths normalised like every other note
+            self.assertIn("# 1 One", text)
+
+    def test_engine_ignores_no_llm_and_honours_explicit_options(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "a.pdf").write_bytes(b"%PDF-1.4 fake")
+            seen = self.run_main(d, [str(Path(d) / "a.pdf"), "--engine", "paddleocr-vl", "--no-llm", "--no-backup",
+                                     "--pages-per-batch", "50"])
+            self.assertEqual(seen["slices"][0][0], (1, 50))
+            self.assertEqual(len(seen["slices"]), 6)
+            self.assertEqual(seen["guards"][0][1], None)                       # no serve command given
+
+    def test_cleanup_can_still_be_asked_for(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "a.pdf").write_bytes(b"%PDF-1.4 fake")
+            seen = self.run_main(d, [str(Path(d) / "a.pdf"), "--engine", "paddleocr-vl", "--clean", "auto", "--no-backup"])
+            self.assertEqual(seen["checks"], ["ollama:gemma4:12b"])           # only then is a text model needed
+
+    def test_split_chapters_and_page_links_work_with_the_engine(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / ".obsidian").mkdir()
+            (Path(d) / "My Book.pdf").write_bytes(b"%PDF-1.4 fake")
+            seen = self.run_main(d, [str(Path(d) / "My Book.pdf"), "--engine", "paddleocr-vl", "--no-backup", "--split-chapters",
+                                     "--pages", "1-10"], md="# 1 One\n\na\n\n# 2 Two\n\nb\n")
+            self.assertTrue(seen["slices"][0][2])                              # the PDF is in a vault: links on
+            names = sorted(p.name for p in (Path(d) / "My Book").glob("*.md"))
+            self.assertEqual(names, ["00 Index.md", "01 One.md", "02 Two.md"])
+
+
 if __name__ == "__main__":
     unittest.main()

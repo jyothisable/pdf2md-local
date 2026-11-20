@@ -1,22 +1,28 @@
 # /// script
 # requires-python = ">=3.10,<3.14"
-# dependencies = ["docling"]
+# dependencies = ["docling==2.150.1"]   # the version this tool is tested with
 # ///
-"""Convert a PDF to Obsidian-flavoured Markdown with Docling + a local Ollama model.
+"""Convert PDFs to Obsidian-flavoured Markdown with a local model.
 
-Pipeline
-  1. Docling parses the PDF (layout, tables, OCR, formula -> LaTeX, figures).
-  2. Equations are tidied and validated. Undecoded or invalid ones are re-read from a
-     crop of the page by the Ollama vision model; figures get a short description.
-  3. Math is normalised deterministically: inline $...$, block $$ on their own lines.
-  4. Ollama (default gemma4:12b) cleans the prose chunk by chunk. Math, tables, code,
-     image embeds and figure descriptions are swapped for placeholders first, so the
-     model cannot alter them. A chunk whose placeholders do not come back intact is
-     retried, then split in halves, and only then kept as-is.
-  5. The finished note is checked for math that will not render, and written to a NEW
-     file (never overwrites), figures as ![[embeds]].
+Two engines (--engine):
 
-Run:  pdf2md paper.pdf            (see pdf2md --help)
+  paddleocr-vl  PaddleOCR-VL-1.6: Paddle's layout model reads each page, a 0.9B vision-language model served by
+                llama.cpp's llama-server reads each block. Best on maths in the project's tests, small (about 3 GB
+                of VRAM) and no Ollama; weaker on tables and scans. Needs a running server (--paddle-server)
+                or --serve-command to start one.
+  docling       Docling parses the layout; a vision model (Ollama, or any OpenAI-compatible server) re-reads
+                equations and rewrites maths paragraphs as LaTeX.
+
+Both feed the same finishing steps:
+  - maths is normalised: inline $...$, display $$ on their own lines; the LaTeX is checked for rendering errors
+  - headings are tidied, optional links to the PDF page are added under them, books can be split into chapters
+  - the note is written to a NEW file (never overwrites), figures as ![[embeds]]
+  - long runs checkpoint per slice and resume; one bad page is retried, then marked, never fatal
+
+With the docling engine a text model can also clean prose (--clean): maths, tables, code and images are swapped
+for placeholders first so the model cannot alter them.
+
+Run:  pdf2md paper.pdf [more.pdf ...]            (see pdf2md --help)
 """
 from __future__ import annotations
 
@@ -24,6 +30,7 @@ import argparse
 import base64
 import datetime as dt
 import hashlib
+import html.parser
 import io
 import json
 import os
@@ -35,6 +42,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -50,6 +58,9 @@ NUM_CTX = 8192           # same for every call, or Ollama reloads the model
 DEFAULT_JOBS = 3         # parallel Ollama requests; keep <= OLLAMA_NUM_PARALLEL on the server
 PAGES_PER_BATCH = 40     # Docling converts big PDFs in slices of this many pages
 CLEAN_MODES = ("auto", "all", "none")
+ENGINES = ("docling", "paddleocr-vl")
+PADDLE_PAGES_PER_BATCH = 120   # the Paddle worker loads its models once per slice, so use bigger slices
+DEFAULT_PADDLE_SERVER = "http://127.0.0.1:8111/v1"
 CACHE_ROOT = Path.home() / ".cache" / "pdf2md"
 MIN_SPLIT_CHARS = 1200
 NOT_DECODED = "formula-not-decoded"
@@ -356,6 +367,64 @@ def ollama_chat(host: str, model: str, system: str, user: str, timeout: int,
     req = urllib.request.Request(f"{host}/api/chat", body, {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)["message"]["content"]
+
+
+API_CHOICES = ("ollama", "openai")
+
+
+def api_base(host: str) -> str:
+    """Base URL of an OpenAI-compatible server. A bare host:port gets /v1 (llama.cpp, LM Studio, vLLM)."""
+    host = host.strip().rstrip("/")
+    return host + "/v1" if urllib.parse.urlparse(host).path in ("", "/") else host
+
+
+def openai_chat(host: str, model: str, system: str | None, user: str, timeout: int,
+                images: list[bytes] | None = None, max_out: int | None = None,
+                api_key: str | None = None) -> str:
+    """One chat completion from any OpenAI-compatible server (llama.cpp's llama-server, LM Studio, vLLM, ...)."""
+    text = {"type": "text", "text": user}
+    imgs = [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(i).decode()}}
+            for i in images or []]
+    content = [text, *imgs]
+    messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": content}]
+    body = {"model": model, "stream": False, "temperature": 0, "messages": messages}
+    if max_out:
+        body["max_tokens"] = max_out
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(f"{api_base(host)}/chat/completions", json.dumps(body).encode(), headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)["choices"][0]["message"]["content"]
+
+
+class Backend:
+    """Where a model lives: an Ollama server or an OpenAI-compatible one."""
+
+    def __init__(self, api: str, host: str, model: str, key: str | None = None):
+        self.api, self.host, self.model, self.key = api, host, model, key
+
+    def chat(self, system: str | None, user: str, timeout: int, images: list[bytes] | None = None,
+             num_ctx: int = NUM_CTX, max_out: int | None = None) -> str:
+        if self.api == "openai":
+            return openai_chat(self.host, self.model, system, user, timeout, images, max_out, self.key)
+        return ollama_chat(self.host, self.model, system or "", user, timeout, images, num_ctx, max_out)
+
+    def check(self) -> None:
+        if self.api == "ollama":
+            check_ollama(self.host, self.model)
+            return
+        headers = {"Authorization": f"Bearer {self.key}"} if self.key else {}
+        try:
+            with urllib.request.urlopen(urllib.request.Request(f"{api_base(self.host)}/models", headers=headers), timeout=5):
+                pass
+        except urllib.error.HTTPError:
+            pass   # the server answered; some do not implement /models
+        except (urllib.error.URLError, OSError) as e:
+            sys.exit(f"error: cannot reach the OpenAI-compatible server at {api_base(self.host)} ({e}).")
+
+    def describe(self) -> str:
+        return f"{self.api}:{self.model}"
 
 
 def check_ollama(host: str, model: str) -> None:
@@ -674,7 +743,7 @@ def run_key(pdf: Path, *parts) -> str:
 
 
 def new_stats() -> dict:
-    return {"eq_total": 0, "eq_tidied": 0, "eq_repaired": 0, "eq_unresolved": 0, "eq_as_text": 0, "eq_pictured": 0,
+    return {"eq_total": 0, "eq_tidied": 0, "eq_repaired": 0, "eq_unresolved": 0, "eq_as_text": 0, "eq_pictured": 0, "eq_flagged": 0,
             "figs_described": 0, "inline_total": 0, "inline_rewritten": 0, "inline_retried_ok": 0}
 
 
@@ -855,6 +924,54 @@ def fallback_problem(para: str) -> str | None:
     return None
 
 
+def link_target(pdf_name: str, page: int) -> str | None:
+    """Obsidian link to a page of the source PDF, or None if the name cannot be linked safely."""
+    if not pdf_name or re.search(r"[\[\]|#^]", pdf_name):
+        return None
+    return f"[[{pdf_name}#page={page}|p. {page}]]"
+
+
+def wants_page_link(text: str, level: int | None) -> bool:
+    """Real headings (not Chapter labels, captions, code, or table-of-contents lines) down to level 3."""
+    t = text.strip()
+    if len(t) < 2 or re.match(r"^Chapter \d{1,3}$", t, re.I) or not_a_heading(t) or TRAILING_PAGE.match(t):
+        return False
+    return level is None or level <= 3
+
+
+TAG_RE = re.compile(r"\\tag\{[^{}]*\}")
+OPEN_END = re.compile(r"(?:[=+\-*/<>]|\\(?:cdot|times|sum|prod|int|to|rightarrow|leftarrow|leq|geq|approx|equiv|left))\s*$")
+EMPTY_GROUP = re.compile(r"[\^_]\{\s*\}|\\(?:frac|sqrt|text|mathrm|mathbf|operatorname)\s*\{\s*\}")
+
+
+def equation_doubt(latex: str, width_pt: float | None = None) -> str | None:
+    """Why valid-looking LaTeX may still be wrong (cut off, empty arguments, too short for its picture)."""
+    body = TAG_RE.sub("", latex)
+    body = re.sub(r"\\(?:begin|end)\{[A-Za-z*]+\}", " ", body)
+    body = re.sub(r"(?:\\\\\s*)+$", "", body.strip()).strip()
+    if not body:
+        return "empty"
+    if EMPTY_GROUP.search(body):
+        return "has an empty group"
+    if OPEN_END.search(body):
+        return "ends in an operator, may be cut off"
+    if width_pt and len(re.sub(r"\s", "", body)) < width_pt / 20:
+        return "short for the space it takes, may be incomplete"
+    return None
+
+
+def flag_equation(latex: str, why: str, png: bytes, page: int | None, pdf_name: str, assets_dir: Path) -> str:
+    """The equation followed by a collapsed callout holding its source picture, for checking against the PDF."""
+    name = f"equation_{hashlib.sha1(png).hexdigest()[:12]}.png"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    (assets_dir / name).write_bytes(png)
+    link = link_target(pdf_name, page) if page else None
+    lines = [f"> [!warning]- Check this equation against the PDF ({why})", f"> ![[{name}]]"]
+    if link:
+        lines.append(f"> {link}")
+    return f"$${latex}$$\n\n" + "\n".join(lines) + "\n"
+
+
 def last_resort_formula(text: str, png: bytes | None, ask_inline: Callable[[bytes, str], str] | None,
                         assets_dir: Path) -> tuple[str, str | None]:
     """An equation nobody could decode: try it as a paragraph (it may be a prose note), else embed its picture."""
@@ -990,9 +1107,11 @@ def convert_slice(conv, pdf: Path, page_range: tuple[int, int], assets_dir: Path
                   ask_figure: Callable[[bytes], str] | None,
                   ask_inline: Callable[[bytes, str], str] | None = None,
                   inline_mode: str = "auto",
-                  ask_retry: Callable[[bytes, str], str] | None = None) -> tuple[str, dict]:
+                  ask_retry: Callable[[bytes, str], str] | None = None,
+                  page_links: bool = False, flag_doubt: bool = True) -> tuple[str, dict]:
     """Convert one page slice. Equation re-reads, figure captions and inline-math rewrites run in parallel."""
-    from docling_core.types.doc import DocItemLabel, FormulaItem, ImageRefMode, PictureItem, TextItem
+    from docling_core.types.doc import (DocItemLabel, FormulaItem, ImageRefMode, PictureItem, SectionHeaderItem,
+                                        TextItem)
 
     doc = conv.convert(str(pdf), page_range=page_range).document
     stats = new_stats()
@@ -1001,6 +1120,7 @@ def convert_slice(conv, pdf: Path, page_range: tuple[int, int], assets_dir: Path
     formulas: list[tuple] = []
     pictures: list[Future | None] = []
     inlines: list[tuple] = []
+    headings: list[tuple] = []
     for item, _ in doc.iterate_items(with_groups=False):
         if isinstance(item, FormulaItem):
             png, fut = None, None
@@ -1024,6 +1144,8 @@ def convert_slice(conv, pdf: Path, page_range: tuple[int, int], assets_dir: Path
                 if im is not None and min(im.size) >= MIN_FIGURE_PX:
                     fut = pool.submit(ask_figure, png_bytes(im))
             pictures.append(fut)
+        elif page_links and isinstance(item, SectionHeaderItem):
+            headings.append((item, item.prov[0].page_no if item.prov else None, getattr(item, "level", None)))
         elif (pool and ask_inline and isinstance(item, TextItem)
               and item.label in (DocItemLabel.TEXT, DocItemLabel.LIST_ITEM, DocItemLabel.CAPTION)
               and looks_mathy(item.text or "", inline_mode)):
@@ -1090,6 +1212,22 @@ def convert_slice(conv, pdf: Path, page_range: tuple[int, int], assets_dir: Path
             item.text = new
         if status != "kept":
             stats[keys[status]] += 1
+        if flag_doubt and status in ("kept", "tidied", "repaired"):
+            why = equation_doubt(new, item.prov[0].bbox.width if item.prov else None)
+            im = item.get_image(doc) if why else None
+            if why and im is not None:       # keep the LaTeX, add a collapsed callout with the source picture
+                marker = f"PDFMDFORMULA{len(swaps)}X"
+                swaps[marker] = flag_equation(new, why, png_bytes(im), item.prov[0].page_no if item.prov else None,
+                                              pdf.name, assets_dir)
+                item.text = marker
+                stats["eq_flagged"] += 1
+    head_marks: list[tuple[str, str]] = []
+    for n, (item, page, level) in enumerate(headings):    # a link to the PDF page under each real heading
+        link = link_target(pdf.name, page) if page else None
+        if link and wants_page_link(item.text or "", level):
+            marker = f"PDFMDHEAD{n}X"
+            head_marks.append((marker, link))
+            item.text = f"{marker} {item.text}"
     descriptions: dict[int, str] = {}
     for n, fut in enumerate(pictures):
         if fut is None:
@@ -1112,6 +1250,8 @@ def convert_slice(conv, pdf: Path, page_range: tuple[int, int], assets_dir: Path
             for f in art.iterdir():
                 shutil.copy2(f, assets_dir / f.name)
     md = apply_swaps(md, swaps)
+    for marker, link in head_marks:
+        md = re.sub(rf"^(#{{1,6}}) {marker} ?(.*)$", lambda m, link=link: f"{m.group(1)} {m.group(2)}\n\n{link}", md, flags=re.M)
 
     def embed(m: re.Match) -> str:
         target = m.group(1)
@@ -1126,6 +1266,175 @@ def convert_slice(conv, pdf: Path, page_range: tuple[int, int], assets_dir: Path
         return out
 
     return re.sub(r"!\[[^\]]*\]\(([^)]+)\)", embed, md), stats
+
+
+# ----------------------------------------------------------------------------
+# PaddleOCR-VL engine: Paddle's layout model + a 0.9B VLM served by llama.cpp (no Ollama)
+# ----------------------------------------------------------------------------
+WORKER = Path(__file__).with_name("paddle_worker.py")
+
+
+class _TableParser(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[str]] = []
+        self.cell: list[str] | None = None
+        self.spans = False
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "tr":
+            self.rows.append([])
+        elif tag in ("td", "th"):
+            self.cell = []
+            if any(str(a.get(k) or "1").strip() not in ("", "1") for k in ("rowspan", "colspan")):
+                self.spans = True
+        elif tag == "br" and self.cell is not None:
+            self.cell.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self.cell is not None and self.rows:
+            self.rows[-1].append(" ".join("".join(self.cell).split()))
+            self.cell = None
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+
+
+def html_table_to_md(table_html: str) -> str | None:
+    """A Markdown table for a simple HTML table, or None when it has merged cells (kept as HTML)."""
+    t = _TableParser()
+    t.feed(table_html)
+    rows = [r for r in t.rows if r]
+    if t.spans or not rows:
+        return None
+    width = max(len(r) for r in rows)
+    esc = lambda c: c.replace("|", "\\|")
+    rows = [[esc(c) for c in r] + [""] * (width - len(r)) for r in rows]
+    lines = ["| " + " | ".join(rows[0]) + " |", "|" + " --- |" * width]
+    lines += ["| " + " | ".join(r) + " |" for r in rows[1:]]
+    return "\n".join(lines)
+
+
+_TABLE = re.compile(r"<table\b.*?</table>", re.S | re.I)
+_DIV = re.compile(r"<div\b[^>]*>\s*(.*?)\s*</div>", re.S | re.I)
+_IMG = re.compile(r"<img\b[^>]*?\bsrc=[\"']([^\"']+)[\"'][^>]*>", re.I)
+
+
+def clean_paddle_markdown(md: str, page_no: int, src_dir: Path | None, assets_dir: Path | None,
+                          link: str | None = None) -> str:
+    """Paddle's page Markdown -> Obsidian Markdown: simple HTML tables become Markdown tables, caption wrappers
+    go, <img> becomes an ![[embed]] (the picture is copied to the assets folder), headings get a PDF page link."""
+    md = _TABLE.sub(lambda m: "\n\n" + (html_table_to_md(m.group(0)) or m.group(0)) + "\n\n", md)
+    md = _DIV.sub(lambda m: m.group(1), md)
+
+    def img(m: re.Match) -> str:
+        src = m.group(1)
+        if src_dir is None or assets_dir is None or not (src_dir / src).is_file():
+            return ""
+        name = f"p{page_no:04d}_{Path(src).name}"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_dir / src, assets_dir / name)
+        return f"![[{name}]]"
+
+    md = _IMG.sub(img, md)
+    out, in_code = [], False
+    for line in md.split("\n"):
+        if line.strip().startswith(("```", "~~~")):
+            in_code = not in_code
+        elif not in_code and not line.lstrip().startswith("|"):
+            line = re.sub(r"(?<=\S)  +(?=\S)", " ", line)         # "Two  $x$-moves" -> one space
+        out.append(line)
+        m = None if (in_code or not link) else HEADING.match(line)
+        if m and wants_page_link(m.group(2), len(m.group(1))):
+            out += ["", link]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip("\n") + "\n"
+
+
+class ServerGuard:
+    """Make sure an OpenAI-compatible server (llama-server) answers; start it with `command` if it does not,
+    and stop it again afterwards if this run started it."""
+
+    def __init__(self, url: str, command: str | None, wait: int = 180):
+        self.url, self.command, self.wait = url, command, wait
+        self.proc: subprocess.Popen | None = None
+        self.log = Path(tempfile.gettempdir()) / "pdf2md-llama-server.log"
+
+    def alive(self) -> bool:
+        try:
+            with urllib.request.urlopen(f"{api_base(self.url)}/models", timeout=3):
+                return True
+        except urllib.error.HTTPError:
+            return True        # it answered
+        except (urllib.error.URLError, OSError):
+            return False
+
+    def __enter__(self) -> "ServerGuard":
+        if self.alive():
+            return self
+        if not self.command:
+            sys.exit(f"error: no PaddleOCR-VL server at {api_base(self.url)}. Start one, for example:\n"
+                     f"  llama-server -m PaddleOCR-VL-1.6-GGUF.gguf --mmproj PaddleOCR-VL-1.6-GGUF-mmproj.gguf "
+                     f"--port 8111 --temp 0 -ngl 99\nor pass --serve-command (see serve-paddleocr-vl.sh).")
+        print(f"      starting the model server: {self.command}", flush=True)
+        with open(self.log, "w") as f:
+            self.proc = subprocess.Popen(shlex.split(self.command), stdout=f, stderr=subprocess.STDOUT,
+                                         start_new_session=True)
+        deadline = time.time() + self.wait
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                sys.exit(f"error: the model server exited (code {self.proc.returncode}); see {self.log}")
+            if self.alive():
+                return self
+            time.sleep(1)
+        self.__exit__()
+        sys.exit(f"error: the model server did not become ready within {self.wait}s; see {self.log}")
+
+    def __exit__(self, *exc) -> None:
+        if self.proc and self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, 15)
+                self.proc.wait(timeout=15)
+            except Exception:  # noqa: BLE001
+                self.proc.kill()
+        self.proc = None
+
+
+def worker_command(pdf: Path, rng: tuple[int, int], server: str, out: Path) -> list[str]:
+    return ["uv", "run", "--python", "3.12", str(WORKER), "--pdf", str(pdf), "--first", str(rng[0]),
+            "--last", str(rng[1]), "--server", server, "--out", str(out)]
+
+
+def paddle_slice(pdf: Path, page_range: tuple[int, int], assets_dir: Path, server: str, page_links: bool
+                 ) -> tuple[str, dict]:
+    """Convert one page slice with the PaddleOCR-VL worker."""
+    stats = new_stats()
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = subprocess.Popen(worker_command(pdf, page_range, server, Path(tmp)), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        bad: list[int] = []
+        for line in proc.stdout:
+            m = re.match(r"PAGE (\d+)/(\d+)", line)
+            if m and (int(m.group(1)) % 25 == 0 or m.group(1) == m.group(2)):
+                print(f"      paddle: page {m.group(1)}/{m.group(2)} of this slice", flush=True)
+            m = re.match(r"ERROR page (\d+)", line)
+            if m:
+                bad.append(int(m.group(1)))
+        rc = proc.wait()
+        dirs = sorted(Path(tmp).glob("page_*"))
+        if rc != 0 and not dirs:
+            raise RuntimeError(f"the PaddleOCR-VL worker failed (exit {rc})")
+        parts = []
+        for d in dirs:
+            page_no = int(d.name[5:])
+            texts = [f.read_text(encoding="utf-8") for f in sorted(d.glob("*.md"))]
+            if texts:
+                link = link_target(pdf.name, page_no) if page_links else None
+                parts.append(clean_paddle_markdown("\n\n".join(texts), page_no, d, assets_dir, link))
+        parts += [f"<!-- page {n} could not be read -->" for n in bad]
+        stats["eq_total"] = sum(len(re.findall(r"\$\$.+?\$\$", t, re.S)) for t in parts)
+        return "\n\n".join(parts), stats
 
 
 # ----------------------------------------------------------------------------
@@ -1161,48 +1470,25 @@ def run_backup(command: str) -> None:
     print(f"backup: {shown or 'done'}")
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="PDF -> Obsidian Markdown (Docling + Ollama)")
-    ap.add_argument("pdf", type=Path)
-    ap.add_argument("-o", "--out", type=Path, help="output .md path or directory (default: next to the PDF)")
-    ap.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama text model (default {DEFAULT_MODEL})")
-    ap.add_argument("--vision-model", help="Ollama vision model for equations/figures (default: --model)")
-    ap.add_argument("--host", default=DEFAULT_HOST)
-    ap.add_argument("--jobs", type=int, default=DEFAULT_JOBS,
-                    help=f"parallel Ollama requests (default {DEFAULT_JOBS}; match OLLAMA_NUM_PARALLEL)")
-    ap.add_argument("--pages-per-batch", type=int, default=PAGES_PER_BATCH,
-                    help=f"convert big PDFs in slices of N pages to bound memory (default {PAGES_PER_BATCH}, 0 = whole file)")
-    ap.add_argument("--pages", help="convert only these pages, e.g. 10-40 (1-based, inclusive)")
-    ap.add_argument("--split-chapters", action="store_true",
-                    help="write a folder of notes (contents, front matter, one note per chapter, back matter) "
-                         "instead of one big note; needs numbered chapter headings")
-    ap.add_argument("--clean", choices=CLEAN_MODES, default="auto",
-                    help="LLM prose cleanup: auto = only chunks showing extraction damage (default), all, none")
-    ap.add_argument("--num-ctx", type=int, default=NUM_CTX, help="Ollama context size per request")
-    ap.add_argument("--no-llm", action="store_true", help="skip every Ollama step")
-    ap.add_argument("--no-vision", action="store_true", help="skip equation re-reading, inline math and figure descriptions")
-    ap.add_argument("--inline-math", choices=INLINE_MODES, default="auto",
-                    help="rewrite paragraphs with inline maths as LaTeX: auto = math-looking ones (default), "
-                         "all = every paragraph (slow, best for maths books), off")
-    ap.add_argument("--no-figure-descriptions", action="store_true", help="do not caption figures")
-    ap.add_argument("--no-ocr", action="store_true", help="disable OCR (text PDFs only; faster)")
-    ap.add_argument("--backup-command", default=os.environ.get("PDF2MD_BACKUP_COMMAND"),
-                    help="command to run before writing into an Obsidian vault (default: $PDF2MD_BACKUP_COMMAND, none)")
-    ap.add_argument("--no-backup", action="store_true", help="skip the backup command")
-    ap.add_argument("--no-cache", action="store_true", help="no checkpointing (an interrupted run cannot resume)")
-    ap.add_argument("--keep-cache", action="store_true", help="keep the checkpoint folder after success")
-    ap.add_argument("--timeout", type=int, default=600, help="seconds per Ollama call")
-    a = ap.parse_args()
+def convert_pdf(a: argparse.Namespace, pdf: Path) -> None:
+    """Convert one PDF according to the parsed arguments."""
 
-    pdf = a.pdf.expanduser().resolve()
-    if not pdf.is_file() or pdf.suffix.lower() != ".pdf":
-        sys.exit(f"error: not a PDF file: {pdf}")
     vmodel = a.vision_model or a.model
-    use_vision = not (a.no_llm or a.no_vision)
-    if not a.no_llm:
-        check_ollama(a.host, a.model)
-        if use_vision and vmodel != a.model:
-            check_ollama(a.host, vmodel)
+    paddle_engine = a.engine == "paddleocr-vl"
+    clean_mode = a.clean or ("none" if paddle_engine else "auto")
+    batch_pages = a.pages_per_batch if a.pages_per_batch is not None else (PADDLE_PAGES_PER_BATCH if paddle_engine else PAGES_PER_BATCH)
+    use_vision = not (a.no_llm or a.no_vision or paddle_engine)   # PaddleOCR-VL does its own reading
+    need_text = not a.no_llm and clean_mode != "none"       # the text model only does prose cleanup
+    text_be = Backend(a.api, a.host, a.model, a.api_key)
+    vis_be = Backend(a.vision_api or a.api, a.vision_host or a.host, vmodel, a.api_key)
+    if need_text:
+        text_be.check()
+    if use_vision:
+        vis_be.check()
+    page_links = a.page_links == "on" or (a.page_links == "auto" and find_vault_root(pdf) is not None)
+    flag_doubt = not a.no_equation_flags
+    engines = (["paddleocr-vl-1.6"] if paddle_engine else ["docling"]) + ([f"vision:{vis_be.describe()}"] if use_vision else []) \
+        + ([f"text:{text_be.describe()}"] if need_text else [])
 
     out = (a.out.expanduser().resolve() if a.out else pdf.parent)
     if out.suffix.lower() != ".md":
@@ -1212,31 +1498,32 @@ def main() -> None:
     assets = out.parent / f"{out.stem}_assets"
 
     def vis(system, user, cap):
-        return lambda png: ollama_chat(a.host, vmodel, system, user, a.timeout, [png], a.num_ctx, MAX_OUT[cap])
+        return lambda png: vis_be.chat(system, user, a.timeout, [png], a.num_ctx, MAX_OUT[cap])
 
     ask_latex = vis(LATEX_SYSTEM, "Transcribe this equation.", "latex") if use_vision else None
     ask_fig = vis(FIGURE_SYSTEM, "Describe this figure.", "figure") if use_vision and not a.no_figure_descriptions else None
-    ask_inline = ((lambda png, text: ollama_chat(a.host, vmodel, INLINE_SYSTEM, f"Extracted text:\n{text}",
-                                                 a.timeout, [png], a.num_ctx, MAX_OUT["inline"]))
+    ask_inline = ((lambda png, text: vis_be.chat(INLINE_SYSTEM, f"Extracted text:\n{text}", a.timeout, [png],
+                                                 a.num_ctx, MAX_OUT["inline"]))
                   if use_vision and a.inline_math != "off" else None)
-    ask_retry = ((lambda png, text: ollama_chat(a.host, vmodel, INLINE_STRICT_SYSTEM, f"Extracted text:\n{text}",
-                                                a.timeout, [png], a.num_ctx, MAX_OUT["inline"]))
+    ask_retry = ((lambda png, text: vis_be.chat(INLINE_STRICT_SYSTEM, f"Extracted text:\n{text}", a.timeout, [png],
+                                                a.num_ctx, MAX_OUT["inline"]))
                  if ask_inline else None)
-    chat = lambda masked: ollama_chat(a.host, a.model, CLEAN_SYSTEM, masked, a.timeout, None, a.num_ctx, MAX_OUT["clean"])
+    chat = lambda masked: text_be.chat(CLEAN_SYSTEM, masked, a.timeout, None, a.num_ctx, MAX_OUT["clean"])
 
     total = page_count(pdf)
     first, last = parse_pages(a.pages, total)
     key = run_key(pdf, not a.no_ocr, use_vision, vmodel, a.model, bool(ask_fig), bool(ask_inline),
-                  a.pages_per_batch, a.num_ctx, a.no_llm, a.inline_math, first, last)
+                  batch_pages, a.num_ctx, a.no_llm, a.inline_math, first, last, a.engine, clean_mode,
+                  a.api, a.vision_api, a.vision_host, page_links, flag_doubt, need_text)
     cache_dir = Path(tempfile.mkdtemp(prefix="pdf2md-")) if a.no_cache else CACHE_ROOT / key
     cache = Cache(cache_dir)
 
     t0 = time.time()
-    ranges = page_ranges(last, a.pages_per_batch, first)
-    pool = ThreadPoolExecutor(max_workers=max(1, a.jobs)) if not a.no_llm else None
+    ranges = page_ranges(last, batch_pages, first)
+    pool = ThreadPoolExecutor(max_workers=max(1, a.jobs)) if (need_text or use_vision) else None
     resumed = len(list(cache_dir.glob("slice_*.json")))
-    print(f"[1/4] Docling: {pdf.name} ({(last - first + 1) if last else '?'} of {total or '?'} pages, {len(ranges)} slice(s)"
-          + (f", {a.jobs} parallel Ollama jobs, {a.model}" if pool else "") + ")"
+    print(f"[1/4] {'PaddleOCR-VL' if paddle_engine else 'Docling'}: {pdf.name} ({(last - first + 1) if last else '?'} of {total or '?'} pages, {len(ranges)} slice(s)"
+          + (f", {a.jobs} parallel jobs; {' + '.join(engines)}" if pool else "") + ")"
           + (f"; resuming, {resumed} slice(s) already done" if resumed else ""))
 
     conv = None
@@ -1252,6 +1539,9 @@ def main() -> None:
         if llm_jobs[1] % 10 == 0 or llm_jobs[1] == llm_jobs[0]:
             print(f"  cleaned {llm_jobs[1]}/{llm_jobs[0]} chunk(s) submitted", flush=True)
 
+    guard = ServerGuard(a.paddle_server, a.serve_command, a.serve_wait) if paddle_engine else None
+    if guard:
+        guard.__enter__()
     try:
         for n, rng in enumerate(ranges, 1):
             ck = f"slice_{rng[0]}_{rng[1]}"
@@ -1260,12 +1550,15 @@ def main() -> None:
                 md, st = hit["md"], hit["stats"]
                 failed_pages += hit["failed"]
             else:
-                if conv is None:
-                    conv = make_converter(not a.no_ocr, use_vision)
                 failed_here: list[int] = []
-                md, st = convert_resilient(
-                    lambda r: convert_slice(conv, pdf, r, cache.img, pool, ask_latex, ask_fig, ask_inline, a.inline_math, ask_retry),
-                    rng, failed_here, free_gpu_memory)
+                if paddle_engine:
+                    convert_fn = lambda r: paddle_slice(pdf, r, cache.img, a.paddle_server, page_links)
+                else:
+                    if conv is None:
+                        conv = make_converter(not a.no_ocr, use_vision)
+                    convert_fn = lambda r: convert_slice(conv, pdf, r, cache.img, pool, ask_latex, ask_fig, ask_inline,
+                                                         a.inline_math, ask_retry, page_links, flag_doubt)
+                md, st = convert_resilient(convert_fn, rng, failed_here, None if paddle_engine else free_gpu_memory)
                 failed_pages += failed_here
                 cache.put(ck, {"md": md, "stats": st, "failed": failed_here})
             totals = merge_stats(totals, st)
@@ -1276,7 +1569,7 @@ def main() -> None:
             print(f"  {label}: {st['eq_total']} equation(s), {st['inline_rewritten']}/{st['inline_total']} inline "
                   f"paragraph(s) as LaTeX, {st['figs_described']} figure(s) [{el:.0f}s{eta}]", flush=True)
             for c in split_chunks(md):
-                if pool and chunk_needs_cleaning(c, a.clean):
+                if pool and chunk_needs_cleaning(c, clean_mode):
                     f = pool.submit(cached_clean, cache, c, chat, a.model)
                     llm_jobs[0] += 1
                     jobs.append(f)
@@ -1287,6 +1580,7 @@ def main() -> None:
 
         print(f"      equations: {totals['eq_total']} (tidied {totals['eq_tidied']}, re-read {totals['eq_repaired']}, "
               f"read as text {totals['eq_as_text']}, kept as picture {totals['eq_pictured']}, "
+              f"flagged for checking {totals['eq_flagged']}, "
               f"unresolved {totals['eq_unresolved']}); inline paragraphs as LaTeX: {totals['inline_rewritten']}"
               f"/{totals['inline_total']} ({totals['inline_retried_ok']} on the stricter retry); "
               f"figures described: {totals['figs_described']}")
@@ -1294,7 +1588,7 @@ def main() -> None:
         if rej:
             print("      inline paragraphs kept as plain text: " + ", ".join(f"{v} {k}" for k, v in sorted(rej.items(), key=lambda kv: -kv[1])))
         if pool:
-            print(f"[2/4] {a.model}: {llm_jobs[0]} chunk(s) to clean ({skipped[0]} left as-is: no damage found), "
+            print(f"[2/4] {text_be.describe() if need_text else 'no text model'}: {llm_jobs[0]} chunk(s) to clean ({skipped[0]} left as-is: no damage found), "
                   f"{llm_jobs[0] - llm_jobs[1]} still running")
         done, kept = [], 0
         for i, j in enumerate(jobs, 1):
@@ -1312,6 +1606,8 @@ def main() -> None:
     finally:
         if pool:
             pool.shutdown(wait=True, cancel_futures=True)
+        if guard:
+            guard.__exit__()
 
     md = fix_headings(md)
     if failed_pages:
@@ -1357,7 +1653,7 @@ def main() -> None:
     else:
         front = (f"---\ntitle: \"{pdf.stem}\"\nsource_pdf: \"{pdf.name}\"\n"
                  f"converted: {date}\n"
-                 f"converter: docling{'' if a.no_llm else f' + ollama:{a.model}'}\n"
+                 f"converter: {' + '.join(engines)}\n"
                  f"math_warnings: {len(issues)}\n"
                  + (f"pages: \"{first}-{last}\"\n" if a.pages else "")
                  + (f"pages_failed: {sorted(failed_pages)}\n" if failed_pages else "")
@@ -1369,6 +1665,83 @@ def main() -> None:
         print(f"      figures: {assets}")
     if not (a.keep_cache and not a.no_cache):
         shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="PDF -> Obsidian Markdown (Docling + a local vision model)")
+    ap.add_argument("pdf", type=Path, nargs="+", help="one or more PDFs, converted one after another")
+    ap.add_argument("-o", "--out", type=Path, help="output .md path or directory (default: next to the PDF)")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama text model (default {DEFAULT_MODEL})")
+    ap.add_argument("--vision-model", help="Ollama vision model for equations/figures (default: --model)")
+    ap.add_argument("--host", default=DEFAULT_HOST,
+                    help="address of the model server (Ollama, or an OpenAI-compatible server such as llama.cpp)")
+    ap.add_argument("--api", choices=API_CHOICES, default="ollama",
+                    help="ollama (default) or openai = any OpenAI-compatible server, e.g. llama-server")
+    ap.add_argument("--api-key", default=os.environ.get("PDF2MD_API_KEY"),
+                    help="API key for the server, if it needs one (default: $PDF2MD_API_KEY)")
+    ap.add_argument("--vision-api", choices=API_CHOICES, help="API of the vision server (default: --api)")
+    ap.add_argument("--vision-host", help="address of the vision server (default: --host)")
+    ap.add_argument("--page-links", choices=("auto", "on", "off"), default="auto",
+                    help="add a link to the PDF page under each heading; auto = when the PDF is inside an Obsidian vault")
+    ap.add_argument("--no-equation-flags", action="store_true",
+                    help="do not add 'check this equation' callouts for equations that look cut off")
+    ap.add_argument("--jobs", type=int, default=DEFAULT_JOBS,
+                    help=f"parallel Ollama requests (default {DEFAULT_JOBS}; match OLLAMA_NUM_PARALLEL)")
+    ap.add_argument("--engine", choices=ENGINES, default="docling",
+                    help="docling = Docling layout + a vision model repairing equations (default); paddleocr-vl = "
+                         "PaddleOCR-VL-1.6 served by llama.cpp (needs --paddle-server; no Ollama)")
+    ap.add_argument("--paddle-server", default=os.environ.get("PDF2MD_PADDLE_SERVER", DEFAULT_PADDLE_SERVER),
+                    help="address of the llama-server running PaddleOCR-VL (default: $PDF2MD_PADDLE_SERVER, "
+                         f"{DEFAULT_PADDLE_SERVER})")
+    ap.add_argument("--serve-command", default=os.environ.get("PDF2MD_SERVE_COMMAND"),
+                    help="command that starts that server; run only if nothing answers, stopped when done "
+                         "(default: $PDF2MD_SERVE_COMMAND; see serve-paddleocr-vl.sh)")
+    ap.add_argument("--serve-wait", type=int, default=180, help="seconds to wait for --serve-command's server")
+    ap.add_argument("--pages-per-batch", type=int, default=None,
+                    help=f"convert big PDFs in slices of N pages (default {PAGES_PER_BATCH}, or "
+                         f"{PADDLE_PAGES_PER_BATCH} with paddleocr-vl; 0 = whole file)")
+    ap.add_argument("--pages", help="convert only these pages, e.g. 10-40 (1-based, inclusive)")
+    ap.add_argument("--split-chapters", action="store_true",
+                    help="write a folder of notes (contents, front matter, one note per chapter, back matter) "
+                         "instead of one big note; needs numbered chapter headings")
+    ap.add_argument("--clean", choices=CLEAN_MODES, default=None,
+                    help="LLM prose cleanup: auto = only chunks showing extraction damage (default for docling), "
+                         "all, none (default for paddleocr-vl)")
+    ap.add_argument("--num-ctx", type=int, default=NUM_CTX, help="Ollama context size per request")
+    ap.add_argument("--no-llm", action="store_true", help="skip every Ollama step")
+    ap.add_argument("--no-vision", action="store_true", help="skip equation re-reading, inline math and figure descriptions")
+    ap.add_argument("--inline-math", choices=INLINE_MODES, default="auto",
+                    help="rewrite paragraphs with inline maths as LaTeX: auto = math-looking ones (default), "
+                         "all = every paragraph (slow, best for maths books), off")
+    ap.add_argument("--no-figure-descriptions", action="store_true", help="do not caption figures")
+    ap.add_argument("--no-ocr", action="store_true", help="disable OCR (text PDFs only; faster)")
+    ap.add_argument("--backup-command", default=os.environ.get("PDF2MD_BACKUP_COMMAND"),
+                    help="command to run before writing into an Obsidian vault (default: $PDF2MD_BACKUP_COMMAND, none)")
+    ap.add_argument("--no-backup", action="store_true", help="skip the backup command")
+    ap.add_argument("--no-cache", action="store_true", help="no checkpointing (an interrupted run cannot resume)")
+    ap.add_argument("--keep-cache", action="store_true", help="keep the checkpoint folder after success")
+    ap.add_argument("--timeout", type=int, default=600, help="seconds per Ollama call")
+    a = ap.parse_args()
+
+    pdfs = [p.expanduser().resolve() for p in a.pdf]
+    bad = [str(p) for p in pdfs if not p.is_file() or p.suffix.lower() != ".pdf"]
+    if bad:
+        sys.exit("error: not a PDF file: " + ", ".join(bad))
+    if len(pdfs) > 1 and a.out and a.out.suffix.lower() == ".md":
+        sys.exit("error: with several PDFs, -o must be a folder, not a .md file")
+    failures: list[str] = []
+    for i, pdf in enumerate(pdfs, 1):
+        if len(pdfs) > 1:
+            print(f"\n=== PDF {i}/{len(pdfs)}: {pdf.name}", flush=True)
+        try:
+            convert_pdf(a, pdf)
+        except SystemExit as e:       # one bad PDF must not stop the rest of a batch
+            if len(pdfs) == 1:
+                raise
+            print(f"error: {pdf.name}: {e.code}", file=sys.stderr, flush=True)
+            failures.append(pdf.name)
+    if failures:
+        sys.exit(f"error: {len(failures)} of {len(pdfs)} PDF(s) failed: " + "; ".join(failures))
 
 
 if __name__ == "__main__":
