@@ -1406,9 +1406,9 @@ def worker_command(pdf: Path, rng: tuple[int, int], server: str, out: Path) -> l
             "--last", str(rng[1]), "--server", server, "--out", str(out)]
 
 
-def paddle_slice(pdf: Path, page_range: tuple[int, int], assets_dir: Path, server: str, page_links: bool
-                 ) -> tuple[str, dict]:
-    """Convert one page slice with the PaddleOCR-VL worker."""
+def paddle_slice(pdf: Path, page_range: tuple[int, int], assets_dir: Path, server: str, page_links: bool,
+                 on_page: Callable[[int, int], None] | None = None) -> tuple[str, dict]:
+    """Convert one page slice with the PaddleOCR-VL worker; on_page(n, total) is called as each page finishes."""
     stats = new_stats()
     with tempfile.TemporaryDirectory() as tmp:
         proc = subprocess.Popen(worker_command(pdf, page_range, server, Path(tmp)), stdout=subprocess.PIPE,
@@ -1416,8 +1416,8 @@ def paddle_slice(pdf: Path, page_range: tuple[int, int], assets_dir: Path, serve
         bad: list[int] = []
         for line in proc.stdout:
             m = re.match(r"PAGE (\d+)/(\d+)", line)
-            if m and (int(m.group(1)) % 25 == 0 or m.group(1) == m.group(2)):
-                print(f"      paddle: page {m.group(1)}/{m.group(2)} of this slice", flush=True)
+            if m and on_page:
+                on_page(int(m.group(1)), int(m.group(2)))
             m = re.match(r"ERROR page (\d+)", line)
             if m:
                 bad.append(int(m.group(1)))
@@ -1539,9 +1539,17 @@ def convert_pdf(a: argparse.Namespace, pdf: Path) -> None:
         if llm_jobs[1] % 10 == 0 or llm_jobs[1] == llm_jobs[0]:
             print(f"  cleaned {llm_jobs[1]}/{llm_jobs[0]} chunk(s) submitted", flush=True)
 
+    total_pages = (last - first + 1) if last else 0
+
+    def progress(done: int) -> None:
+        """A machine-readable line for the plugin's progress window: pages finished of pages to convert."""
+        if total_pages:
+            print(f"PROGRESS {max(0, min(done, total_pages))} {total_pages}", flush=True)
+
     guard = ServerGuard(a.paddle_server, a.serve_command, a.serve_wait) if paddle_engine else None
     if guard:
         guard.__enter__()
+    progress(0)
     try:
         for n, rng in enumerate(ranges, 1):
             ck = f"slice_{rng[0]}_{rng[1]}"
@@ -1552,7 +1560,8 @@ def convert_pdf(a: argparse.Namespace, pdf: Path) -> None:
             else:
                 failed_here: list[int] = []
                 if paddle_engine:
-                    convert_fn = lambda r: paddle_slice(pdf, r, cache.img, a.paddle_server, page_links)
+                    convert_fn = lambda r: paddle_slice(pdf, r, cache.img, a.paddle_server, page_links,
+                                                        lambda i, _t, r=r: progress(r[0] - first + i))
                 else:
                     if conv is None:
                         conv = make_converter(not a.no_ocr, use_vision)
@@ -1562,6 +1571,7 @@ def convert_pdf(a: argparse.Namespace, pdf: Path) -> None:
                 failed_pages += failed_here
                 cache.put(ck, {"md": md, "stats": st, "failed": failed_here})
             totals = merge_stats(totals, st)
+            progress(rng[1] - first + 1)
             md = unescape_entities(normalize_math(md))
             el = time.time() - t0
             eta = f", ETA ~{el / n * (len(ranges) - n) / 60:.0f} min" if len(ranges) > 1 and n < len(ranges) else ""

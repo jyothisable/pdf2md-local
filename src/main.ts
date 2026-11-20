@@ -25,16 +25,20 @@ import {
 	DEFAULT_SETTINGS,
 	InlineMode,
 	PageLinks,
-	Progress,
+	ProgressState,
 	Settings,
 	Engine,
 	apiBase,
-	batchLabel,
+	etaLabel,
+	formatDuration,
+	fractionOverall,
+	initialState,
 	buildArgs,
 	clampInt,
 	noteToOpen,
 	parseLine,
-	statusText,
+	reduce,
+	statusBarText,
 	toVaultPath,
 	toolEnv,
 	validPages,
@@ -52,7 +56,17 @@ interface Job {
 	files: TFile[];
 	wrote: { path: string; split: boolean }[];
 	errors: string[];
-	progress: Progress | null;
+	cancelled: boolean;
+}
+
+/** What the progress window shows. It outlives the process so the result stays readable after it ends. */
+interface RunView {
+	running: boolean;
+	files: TFile[];
+	state: ProgressState;
+	wrote: { path: string; split: boolean }[];
+	error?: string;
+	endedAt?: number;
 }
 
 export default class Pdf2MdPlugin extends Plugin {
@@ -60,11 +74,17 @@ export default class Pdf2MdPlugin extends Plugin {
 	private job: Job | null = null;
 	private log: string[] = [];
 	private statusEl: HTMLElement | null = null;
+	private view: RunView | null = null;
+	private modal: ProgressModal | null = null;
 
 	async onload() {
 		await this.loadSettings();
 		this.statusEl = this.addStatusBarItem();
+		this.statusEl.addClass("pdf2md-status");
+		this.statusEl.setAttribute("aria-label", "Show the PDF conversion progress");
+		this.statusEl.addEventListener("click", () => this.showProgress());
 		this.statusEl.hide();
+		this.registerInterval(window.setInterval(() => this.tick(), 1000));
 
 		this.addCommand({
 			id: "convert-pdf",
@@ -97,6 +117,11 @@ export default class Pdf2MdPlugin extends Plugin {
 			id: "cancel-conversion",
 			name: "Cancel the running PDF conversion",
 			callback: () => this.cancel(),
+		});
+		this.addCommand({
+			id: "show-progress",
+			name: "Show conversion progress",
+			callback: () => this.showProgress(),
 		});
 		this.addCommand({
 			id: "show-log",
@@ -306,15 +331,12 @@ export default class Pdf2MdPlugin extends Plugin {
 			env: this.env(),
 			detached: process.platform !== "win32",
 		});
-		const job: Job = { proc, files, wrote: [], errors: [], progress: null };
+		const job: Job = { proc, files, wrote: [], errors: [], cancelled: false };
 		this.job = job;
-		const what = files.length === 1 ? files[0].name : `${files.length} PDFs`;
-		new Notice(
-			`PDF to Markdown: converting ${what}. The first run downloads models and can take several minutes; ` +
-				`long books take an hour or more. Progress is in the status bar.`,
-			10000,
-		);
-		this.setStatus("PDF→MD: starting…");
+		this.view = { running: true, files, state: initialState(Date.now(), files.length), wrote: job.wrote };
+		this.updateStatus();
+		if (this.settings.progressWindow) this.showProgress();
+		else new Notice("PDF to Markdown: converting. Click the status bar to see progress.", 6000);
 
 		const feed = lineSplitter((line) => this.onLine(job, line));
 		proc.stdout?.on("data", (d: Buffer) => feed(d.toString()));
@@ -328,19 +350,31 @@ export default class Pdf2MdPlugin extends Plugin {
 		this.log.push(line);
 		if (this.log.length > MAX_LOG_LINES) this.log.splice(1, this.log.length - MAX_LOG_LINES);
 		const p = parseLine(line);
-		if (p.kind === "pdf") job.progress = p;
-		const text = statusText(p, batchLabel(job.progress));
-		if (text) this.setStatus(text);
+		if (this.view) this.view.state = reduce(this.view.state, p, Date.now());
 		if (p.kind === "wrote") job.wrote.push({ path: p.path, split: p.split });
 		if (p.kind === "error") job.errors.push(p.text);
+		this.tick();
 	}
 
 	private async finish(job: Job, code: number | null, note?: string) {
 		if (this.job !== job) return;
 		this.job = null;
-		this.setStatus(null);
 		const total = job.files.length;
-		if (code === 0 && job.wrote.length) {
+		const ok = code === 0 && job.wrote.length > 0 && !job.cancelled;
+		if (this.view) {
+			this.view.running = false;
+			this.view.endedAt = Date.now();
+			if (!ok) {
+				this.view.error = job.cancelled
+					? "Cancelled. A later run resumes from the last finished slice."
+					: (job.errors[job.errors.length - 1] ?? note ?? `exit code ${code}`);
+			}
+		}
+		this.updateStatus();
+		this.modal?.refresh();
+		const watching = this.modal !== null;       // the window is open: it shows the result, so no popup or auto-open
+		if (ok) {
+			if (watching) return;
 			if (total === 1) {
 				new Notice(`PDF to Markdown: finished ${job.files[0].name}.`, 8000);
 				await this.openResult(job.wrote[0]);
@@ -349,9 +383,51 @@ export default class Pdf2MdPlugin extends Plugin {
 			}
 			return;
 		}
-		const why = job.errors[job.errors.length - 1] ?? note ?? `exit code ${code}`;
+		if (job.cancelled || watching) return;
 		const partial = job.wrote.length ? `${job.wrote.length} of ${total} converted. ` : "";
-		new Notice(`PDF to Markdown failed: ${partial}${why}. See "Show the last PDF conversion log".`, 12000);
+		new Notice(`PDF to Markdown failed: ${partial}${this.view?.error}. See "Show the last PDF conversion log".`, 12000);
+	}
+
+	// ---- progress window ---------------------------------------------------------------------
+
+	runView(): RunView | null {
+		return this.view;
+	}
+
+	logTail(n: number): string {
+		return this.log.slice(-n).join("\n");
+	}
+
+	showProgress() {
+		if (!this.view) {
+			new Notice("PDF to Markdown: no conversion has run yet.");
+			return;
+		}
+		if (this.modal) return;
+		this.modal = new ProgressModal(this.app, this, () => {
+			this.modal = null;
+		});
+		this.modal.open();
+	}
+
+	async openNote(w: { path: string; split: boolean }) {
+		await this.openResult(w);
+	}
+
+	/** Once a second while running: the status bar and the window recompute elapsed time and ETA. */
+	private tick() {
+		this.updateStatus();
+		this.modal?.refresh();
+	}
+
+	private updateStatus() {
+		if (!this.statusEl) return;
+		if (this.view?.running) {
+			this.statusEl.setText(statusBarText(this.view.state, Date.now()));
+			this.statusEl.show();
+		} else {
+			this.statusEl.hide();
+		}
 	}
 
 	private async openResult(w: { path: string; split: boolean }) {
@@ -376,23 +452,14 @@ export default class Pdf2MdPlugin extends Plugin {
 			if (!quiet) new Notice("PDF to Markdown: nothing is running.");
 			return;
 		}
+		job.cancelled = true;
 		try {
 			if (process.platform !== "win32" && job.proc.pid) process.kill(-job.proc.pid, "SIGTERM");
 			else job.proc.kill();
 		} catch {
 			job.proc.kill();
 		}
-		if (!quiet) new Notice("PDF to Markdown: cancelled. A later run resumes from the last finished slice.");
-	}
-
-	private setStatus(text: string | null) {
-		if (!this.statusEl) return;
-		if (text) {
-			this.statusEl.setText(text);
-			this.statusEl.show();
-		} else {
-			this.statusEl.hide();
-		}
+		if (!quiet) new Notice("PDF to Markdown: cancelling…");
 	}
 }
 
@@ -551,6 +618,82 @@ class PageRangeModal extends Modal {
 	}
 }
 
+/** Progress bar, stage, elapsed time and ETA. Closing it leaves the conversion running; the status bar brings it back. */
+class ProgressModal extends Modal {
+	private bodyEl!: HTMLElement;
+
+	constructor(app: App, private plugin: Pdf2MdPlugin, private onGone: () => void) {
+		super(app);
+	}
+
+	onOpen() {
+		this.modalEl.addClass("pdf2md-progress");
+		this.bodyEl = this.contentEl.createDiv();
+		this.refresh();
+	}
+
+	onClose() {
+		this.contentEl.empty();
+		this.onGone();
+	}
+
+	/** Redraw from the current state. Cheap: called once a second and on every line of output. */
+	refresh() {
+		const v = this.plugin.runView();
+		if (!v || !this.bodyEl) return;
+		const now = v.endedAt ?? Date.now();
+		const s = v.state;
+		const el = this.bodyEl;
+		el.empty();
+
+		const single = v.files.length === 1;
+		this.titleEl.setText(single ? `Converting ${v.files[0].name}` : `Converting ${v.files.length} PDFs`);
+		const failed = !!v.error;
+		const done = !v.running && !failed;
+
+		if (!single) {
+			el.createDiv({ cls: "pdf2md-line", text: `PDF ${Math.min(s.pdfIndex, s.pdfTotal)} of ${s.pdfTotal}${s.pdfName ? ` · ${s.pdfName}` : ""}` });
+		}
+		const pct = done ? 100 : Math.round(fractionOverall(s) * 100);
+		const bar = el.createDiv({ cls: "pdf2md-bar-outer" });
+		const inner = bar.createDiv({ cls: "pdf2md-bar-inner" });
+		if (v.running && s.pagesTotal === 0) inner.addClass("is-indeterminate");
+		else inner.style.width = `${pct}%`;
+		if (failed) inner.addClass("is-failed");
+
+		const pages = s.pagesTotal > 0 ? `Page ${Math.min(s.pagesDone, s.pagesTotal)} of ${s.pagesTotal}` : "Preparing…";
+		el.createDiv({ cls: "pdf2md-big", text: failed ? "Stopped" : done ? "Finished" : `${pct}%` });
+		if (v.running) el.createDiv({ cls: "pdf2md-line", text: `${pages}${single ? "" : " in this PDF"}` });
+		el.createDiv({ cls: "pdf2md-line pdf2md-muted", text: v.running ? s.stage : failed ? v.error : `${s.wrote} note${s.wrote === 1 ? "" : "s"} written` });
+		const elapsed = formatDuration(Math.max(0, (now - s.startedAt) / 1000));
+		el.createDiv({
+			cls: "pdf2md-line",
+			text: v.running ? `Elapsed ${elapsed} · ${etaLabel(s, now)}` : `Took ${elapsed}`,
+		});
+
+		const details = el.createEl("details", { cls: "pdf2md-details" });
+		details.createEl("summary", { text: "Details" });
+		details.createEl("pre", { cls: "pdf2md-log", text: this.plugin.logTail(14) });
+
+		const buttons = el.createDiv({ cls: "pdf2md-buttons" });
+		if (v.running) {
+			const bg = buttons.createEl("button", { text: "Run in background", cls: "mod-cta" });
+			bg.addEventListener("click", () => this.close());
+			const cancel = buttons.createEl("button", { text: "Cancel conversion", cls: "mod-warning" });
+			cancel.addEventListener("click", () => this.plugin.cancel());
+		} else {
+			if (done && single && v.wrote[0]) {
+				const open = buttons.createEl("button", { text: "Open note", cls: "mod-cta" });
+				open.addEventListener("click", () => {
+					this.close();
+					void this.plugin.openNote(v.wrote[0]);
+				});
+			}
+			buttons.createEl("button", { text: "Close", cls: done && !single ? "mod-cta" : "" }).addEventListener("click", () => this.close());
+		}
+	}
+}
+
 class LogModal extends Modal {
 	constructor(app: App, private text: string) {
 		super(app);
@@ -651,6 +794,8 @@ class Pdf2MdSettingTab extends PluginSettingTab {
 			.addDropdown((d) => d.addOptions({ auto: "auto", on: "always", off: "never" }).setValue(s.pageLinks).onChange(async (v) => { s.pageLinks = v as PageLinks; await save(); }));
 		new Setting(containerEl).setName("Flag equations that look cut off").setDesc("Adds a collapsed callout with the source picture under an equation that may be incomplete.")
 			.addToggle((t) => t.setValue(s.equationFlags).onChange(async (v) => { s.equationFlags = v; await save(); }));
+		new Setting(containerEl).setName("Show a progress window").setDesc("Opens when a conversion starts, with a progress bar and the time left. Close it to keep working: the conversion continues, and clicking the status bar reopens it.")
+			.addToggle((t) => t.setValue(s.progressWindow).onChange(async (v) => { s.progressWindow = v; await save(); }));
 		new Setting(containerEl).setName("Ask which pages to convert").setDesc("Prompt for a page range before every single-PDF conversion. The command \"Convert PDF pages…\" always asks.")
 			.addToggle((t) => t.setValue(s.askForPages).onChange(async (v) => { s.askForPages = v; await save(); }));
 

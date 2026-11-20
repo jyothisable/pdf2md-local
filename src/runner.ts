@@ -30,6 +30,8 @@ export interface Settings {
 	equationFlags: boolean;
 	/** Ask which pages to convert before every single-PDF conversion. */
 	askForPages: boolean;
+	/** Open the progress window when a conversion starts (it can be closed to run in the background). */
+	progressWindow: boolean;
 	textModel: string;
 	/** Empty = use the text model for vision too. */
 	visionModel: string;
@@ -63,6 +65,7 @@ export const DEFAULT_SETTINGS: Settings = {
 	pageLinks: "auto",
 	equationFlags: true,
 	askForPages: false,
+	progressWindow: true,
 	textModel: "gemma4:12b",
 	visionModel: "",
 	jobs: 3,
@@ -141,6 +144,7 @@ export function clampInt(v: number, lo: number, hi: number): number {
 }
 
 export type Progress =
+	| { kind: "pages"; done: number; total: number }
 	| { kind: "pdf"; n: number; total: number; name: string }
 	| { kind: "slice"; n: number; total: number; etaMin?: number }
 	| { kind: "cleaning"; done: number; total: number }
@@ -152,7 +156,9 @@ export type Progress =
 /** Interpret one line of the tool's output. */
 export function parseLine(line: string): Progress {
 	const l = line.trim();
-	let m = /^=== PDF (\d+)\/(\d+): (.+)$/.exec(l);
+	let m = /^PROGRESS (\d+) (\d+)$/.exec(l);
+	if (m) return { kind: "pages", done: +m[1], total: +m[2] };
+	m = /^=== PDF (\d+)\/(\d+): (.+)$/.exec(l);
 	if (m) return { kind: "pdf", n: +m[1], total: +m[2], name: m[3] };
 	m = /^slice (\d+)\/(\d+)/.exec(l);
 	if (m) {
@@ -243,4 +249,109 @@ export function toolEnv(env: Record<string, string | undefined>, home: string, a
 	out.PYTHONUNBUFFERED = "1";
 	if (apiKey.trim()) out.PDF2MD_API_KEY = apiKey.trim();
 	return out;
+}
+
+// ---- progress window ---------------------------------------------------------------------------------------
+
+export interface Sample {
+	t: number;
+	done: number;
+}
+
+export interface ProgressState {
+	startedAt: number;
+	pdfIndex: number;
+	pdfTotal: number;
+	pdfName: string;
+	pdfStartedAt: number;
+	pagesDone: number;
+	pagesTotal: number;
+	samples: Sample[];
+	stage: string;
+	finishedMs: number[];
+	wrote: number;
+	lastError: string;
+}
+
+export function initialState(now: number, pdfTotal: number): ProgressState {
+	return {
+		startedAt: now, pdfIndex: 1, pdfTotal, pdfName: "", pdfStartedAt: now, pagesDone: 0, pagesTotal: 0,
+		samples: [], stage: "Starting", finishedMs: [], wrote: 0, lastError: "",
+	};
+}
+
+/** Fold one line of tool output into the progress state. Pure: the window and the status bar both read this. */
+export function reduce(s: ProgressState, p: Progress, now: number): ProgressState {
+	switch (p.kind) {
+		case "pdf":
+			return { ...s, pdfIndex: p.n, pdfTotal: p.total, pdfName: p.name, pdfStartedAt: now, pagesDone: 0,
+				pagesTotal: 0, samples: [], stage: "Starting" };
+		case "pages": {
+			const samples = [...s.samples, { t: now, done: p.done }].slice(-300);
+			const reading = p.total <= 0 || p.done < p.total;
+			return { ...s, pagesDone: p.done, pagesTotal: p.total, samples, stage: reading ? "Reading pages" : "Finishing up" };
+		}
+		case "cleaning":
+			return { ...s, stage: `Cleaning text (${p.done}/${p.total})` };
+		case "stage":
+			if (p.stage === 2) return { ...s, stage: "Cleaning text" };
+			if (p.stage === 3) return { ...s, stage: "Checking the maths" };
+			return s;
+		case "wrote":
+			return { ...s, stage: "Saved", wrote: s.wrote + 1, finishedMs: [...s.finishedMs, now - s.pdfStartedAt] };
+		case "error":
+			return { ...s, lastError: p.text };
+		default:
+			return s;
+	}
+}
+
+/** Share of the whole job done, 0..1 (several PDFs count equally). */
+export function fractionOverall(s: ProgressState): number {
+	const cur = s.pagesTotal > 0 ? Math.min(1, s.pagesDone / s.pagesTotal) : 0;
+	return Math.min(1, (s.pdfIndex - 1 + cur) / Math.max(1, s.pdfTotal));
+}
+
+/**
+ * Seconds left, or null while there is not enough data. The speed is measured over the last five minutes, so pages
+ * that were skipped instantly because a resumed run already had them do not make the estimate too optimistic.
+ */
+export function etaSeconds(s: ProgressState, now: number): number | null {
+	if (s.pagesTotal <= 0) return null;
+	const recent = s.samples.filter((x) => now - x.t <= 300_000);
+	const pool = recent.length >= 2 ? recent : s.samples.slice(-2);   // slow progress: just the last two readings
+	if (pool.length < 2) return null;
+	const first = pool[0];
+	const last = pool[pool.length - 1];
+	const rate = (last.done - first.done) / Math.max(1, (last.t - first.t) / 1000);
+	if (!(rate > 0)) return null;
+	const cur = Math.max(0, s.pagesTotal - s.pagesDone) / rate;
+	const waiting = Math.max(0, s.pdfTotal - s.pdfIndex);
+	if (!waiting) return cur;
+	const perPdf = s.finishedMs.length
+		? s.finishedMs.reduce((a, b) => a + b, 0) / s.finishedMs.length / 1000
+		: (now - s.pdfStartedAt) / 1000 + cur;
+	return cur + waiting * perPdf;
+}
+
+export function formatDuration(sec: number): string {
+	if (sec < 60) return `${Math.max(1, Math.round(sec))} s`;
+	if (sec < 5400) return `${Math.max(1, Math.round(sec / 60))} min`;
+	const h = Math.floor(sec / 3600);
+	const m = Math.round((sec - h * 3600) / 60);
+	return m === 60 ? `${h + 1} h` : `${h} h ${m} min`;
+}
+
+export function etaLabel(s: ProgressState, now: number): string {
+	const e = etaSeconds(s, now);
+	if (e === null) return "estimating…";
+	return e < 5 ? "almost done" : `about ${formatDuration(e)} left`;
+}
+
+/** Compact text for the clickable status bar item. */
+export function statusBarText(s: ProgressState, now: number): string {
+	const pct = Math.round(fractionOverall(s) * 100);
+	const e = etaSeconds(s, now);
+	const batch = s.pdfTotal > 1 ? `PDF ${s.pdfIndex}/${s.pdfTotal} · ` : "";
+	return `PDF→MD: ${batch}${pct}%` + (e !== null && e >= 5 ? ` · ~${formatDuration(e)}` : "");
 }

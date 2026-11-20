@@ -1199,6 +1199,15 @@ class PaddleSliceTests(unittest.TestCase):
         "    (d / 'doc.md').write_text(f'# Part {chr(64 + p)}\\n\\nText on page {p}. $ x $\\n\\n<img src=\"imgs/a.jpg\" />\\n\\n$$ y $$\\n')\n"
         "    print(f'PAGE {p - first + 1}/{last - first + 1}', flush=True)\n")
 
+    def test_every_page_is_reported_as_it_finishes(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            seen = []
+            with mock.patch.object(m, "worker_command", self.fake_worker(d, self.WORKER)):
+                m.paddle_slice(Path(d) / "b.pdf", (1, 5), Path(d) / "assets", "http://s/v1", False,
+                               lambda n, total: seen.append((n, total)))
+            self.assertEqual(seen, [(1, 5), (2, 5), (4, 5), (5, 5)])           # page 3 failed, so no tick
+
     def test_pages_are_joined_cleaned_and_bad_pages_marked(self):
         from unittest import mock
         with tempfile.TemporaryDirectory() as d:
@@ -1246,8 +1255,11 @@ class PaddleEngineMainTests(unittest.TestCase):
             def __exit__(self, *a):
                 seen["guards"].append("exit")
 
-        def fake_slice(pdf, rng, assets, server, page_links):
+        def fake_slice(pdf, rng, assets, server, page_links, on_page=None):
             seen["slices"].append((rng, server, page_links))
+            for i in range(1, rng[1] - rng[0] + 2):      # the worker reports every page
+                if on_page:
+                    on_page(i, rng[1] - rng[0] + 1)
             return md, m.new_stats()
 
         with mock.patch.object(m, "paddle_slice", fake_slice), mock.patch.object(m, "ServerGuard", FakeGuard), \
@@ -1300,3 +1312,44 @@ class PaddleEngineMainTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProgressLineTests(unittest.TestCase):
+    def lines(self, argv, **kw):
+        import contextlib
+        import io
+        from unittest import mock
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "a.pdf").write_bytes(b"%PDF-1.4 fake")
+            with contextlib.redirect_stdout(buf), \
+                 mock.patch.object(m, "page_count", lambda p: kw.get("pages", 100)), \
+                 mock.patch.object(m, "make_converter", lambda *a, **k: object()), \
+                 mock.patch.object(m, "convert_slice", lambda *a, **k: ("t\n", m.new_stats())), \
+                 mock.patch.object(m, "paddle_slice", kw.get("paddle", lambda *a, **k: ("t\n", m.new_stats()))), \
+                 mock.patch.object(m, "ServerGuard", type("G", (), {"__init__": lambda s, *a: None,
+                                                                    "__enter__": lambda s: s, "__exit__": lambda s, *a: None})), \
+                 mock.patch.object(m, "CACHE_ROOT", Path(d) / "cache"), \
+                 mock.patch.object(sys, "argv", ["pdf_to_md", str(Path(d) / "a.pdf"), "--no-backup", *argv]):
+                m.main()
+        return [l for l in buf.getvalue().splitlines() if l.startswith("PROGRESS ")]
+
+    def test_docling_reports_after_each_slice(self):
+        got = self.lines(["--no-llm", "--pages-per-batch", "40"])
+        self.assertEqual(got, ["PROGRESS 0 100", "PROGRESS 40 100", "PROGRESS 80 100", "PROGRESS 100 100"])
+
+    def test_page_ranges_count_only_the_converted_pages(self):
+        got = self.lines(["--no-llm", "--pages", "11-30", "--pages-per-batch", "10"])
+        self.assertEqual(got, ["PROGRESS 0 20", "PROGRESS 10 20", "PROGRESS 20 20"])
+
+    def test_paddle_reports_every_page_with_the_slice_offset(self):
+        def fake(pdf, rng, assets, server, page_links, on_page=None):
+            for i in range(1, rng[1] - rng[0] + 2):
+                on_page(i, rng[1] - rng[0] + 1)
+            return "t\n", m.new_stats()
+
+        got = self.lines(["--engine", "paddleocr-vl", "--pages-per-batch", "3"], pages=7, paddle=fake)
+        self.assertEqual(got[0], "PROGRESS 0 7")
+        self.assertEqual([int(g.split()[1]) for g in got],
+                         [0, 1, 2, 3, 3, 4, 5, 6, 6, 7, 7])            # per page, then the slice-end tick
+        self.assertEqual(got[-1], "PROGRESS 7 7")

@@ -80,8 +80,10 @@ the plugin, choose the PaddleOCR-VL engine and press *Use bundled script*.
 - Command palette: **Convert PDF to Markdown**, **Convert PDF pages…** (asks for a range such as `10-40`),
   **Convert several PDFs…** (a searchable checklist), **Cancel**, **Show the last log**.
 
-Progress, with an estimate for long books, is shown in the status bar. A single conversion opens the resulting note
-(or the book's index) when it finishes. The first run downloads Python packages and models and takes several minutes.
+A progress window shows a bar, the current page, the stage and the time left. **Run in background** closes it while the
+conversion continues; the status bar shows the percentage and time left, and clicking it brings the window back (or
+use the command *Show conversion progress*). When a conversion finishes with the window closed, the resulting note (or
+the book's index) opens. The first run downloads Python packages and models and takes several minutes.
 
 ## Command line
 

@@ -32,3 +32,55 @@
 	padding: 2px 0;
 	cursor: pointer;
 }
+
+.pdf2md-status {
+	cursor: pointer;
+}
+.pdf2md-progress {
+	width: 460px;
+	max-width: 92vw;
+}
+.pdf2md-bar-outer {
+	height: 12px;
+	border-radius: 6px;
+	background: var(--background-modifier-border);
+	overflow: hidden;
+	margin: var(--size-4-2) 0;
+}
+.pdf2md-bar-inner {
+	height: 100%;
+	width: 0;
+	background: var(--interactive-accent);
+	border-radius: 6px;
+	transition: width 0.4s ease;
+}
+.pdf2md-bar-inner.is-failed {
+	background: var(--text-error);
+}
+.pdf2md-bar-inner.is-indeterminate {
+	width: 35%;
+	animation: pdf2md-slide 1.4s ease-in-out infinite alternate;
+}
+@keyframes pdf2md-slide {
+	from { margin-left: 0; }
+	to { margin-left: 65%; }
+}
+.pdf2md-big {
+	font-size: var(--font-ui-large);
+	font-weight: var(--font-bold);
+}
+.pdf2md-line {
+	margin: 2px 0;
+}
+.pdf2md-muted {
+	color: var(--text-muted);
+}
+.pdf2md-details {
+	margin-top: var(--size-4-3);
+}
+.pdf2md-buttons {
+	display: flex;
+	gap: var(--size-4-2);
+	justify-content: flex-end;
+	margin-top: var(--size-4-4);
+}

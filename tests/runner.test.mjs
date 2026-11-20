@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
 	DEFAULT_SETTINGS, splitArgs, buildArgs, parseLine, statusText, augmentedPath, toVaultPath, noteToOpen, clampInt,
 	apiBase, batchLabel, validPages, toolEnv,
+	initialState, reduce, fractionOverall, etaSeconds, formatDuration, etaLabel, statusBarText,
 } from "../.test-build/runner.mjs";
 
 test("splitArgs honours quotes and empty input", () => {
@@ -158,4 +159,81 @@ test("toolEnv adds PATH and the key without losing the rest", () => {
 	assert.equal(e.PYTHONUNBUFFERED, "1");
 	assert.ok(!("EMPTY" in e));
 	assert.ok(!("PDF2MD_API_KEY" in toolEnv({}, "/h", "  ")));
+});
+
+const T0 = 1_000_000;
+const feed = (state, lines, t) => lines.reduce((st, l) => reduce(st, parseLine(l), t), state);
+
+test("parseLine reads the tool's PROGRESS lines", () => {
+	assert.deepEqual(parseLine("PROGRESS 120 552"), { kind: "pages", done: 120, total: 552 });
+	assert.equal(parseLine("PROGRESS x y").kind, "other");
+});
+
+test("a single conversion: percentage, stage and ETA follow the pages", () => {
+	let s = initialState(T0, 1);
+	assert.equal(etaSeconds(s, T0), null);
+	assert.equal(etaLabel(s, T0), "estimating…");
+	s = feed(s, ["PROGRESS 0 100"], T0);
+	assert.equal(fractionOverall(s), 0);
+	assert.equal(etaSeconds(s, T0), null, "one sample is not enough");
+	s = feed(s, ["PROGRESS 10 100"], T0 + 40_000);                     // 10 pages in 40 s
+	assert.equal(fractionOverall(s), 0.1);
+	assert.equal(s.stage, "Reading pages");
+	assert.equal(Math.round(etaSeconds(s, T0 + 40_000)), 360);         // 90 pages left at 0.25 pages/s
+	assert.equal(statusBarText(s, T0 + 40_000), "PDF→MD: 10% · ~6 min");
+	s = feed(s, ["PROGRESS 100 100"], T0 + 400_000);
+	assert.equal(s.stage, "Finishing up");
+	assert.equal(etaSeconds(s, T0 + 400_000), 0);
+	assert.equal(etaLabel(s, T0 + 400_000), "almost done");
+	s = feed(s, ["[2/4] gemma: 3 chunk(s) to clean", "  cleaned 1/3 chunk(s) submitted", "[3/4] math check: 0 problem(s)"], T0 + 410_000);
+	assert.equal(s.stage, "Checking the maths");
+	s = feed(s, ["  cleaned 2/3 chunk(s) submitted"], T0 + 411_000);
+	assert.equal(s.stage, "Cleaning text (2/3)");
+	s = feed(s, ["[4/4] wrote /v/a.md (400s)"], T0 + 420_000);
+	assert.equal(s.stage, "Saved");
+	assert.equal(s.wrote, 1);
+});
+
+test("a resumed run does not look faster than it is", () => {
+	let s = initialState(T0, 1);
+	s = feed(s, ["PROGRESS 0 200"], T0);
+	s = feed(s, ["PROGRESS 120 200"], T0 + 2_000);                     // 120 cached pages skipped instantly
+	const early = etaSeconds(s, T0 + 2_000);
+	assert.ok(early !== null && early < 5, "right after the jump the window still holds it");
+	s = feed(s, ["PROGRESS 130 200"], T0 + 400_000);                   // later: real pace, 10 pages in ~6 min
+	const later = etaSeconds(s, T0 + 400_000);
+	assert.ok(later > 1500, `the old jump must age out of the estimate (got ${later}s)`);
+});
+
+test("a batch: overall percentage, per-PDF reset, ETA from finished PDFs", () => {
+	let s = initialState(T0, 3);
+	s = feed(s, ["=== PDF 1/3: a.pdf", "PROGRESS 0 10"], T0);
+	s = feed(s, ["PROGRESS 10 10", "[4/4] wrote /v/a.md (100s)"], T0 + 100_000);
+	assert.deepEqual(s.finishedMs, [100_000]);
+	s = feed(s, ["=== PDF 2/3: b.pdf", "PROGRESS 0 20"], T0 + 101_000);
+	assert.equal(s.pagesDone, 0);
+	assert.equal(s.pdfName, "b.pdf");
+	s = feed(s, ["PROGRESS 10 20"], T0 + 151_000);                     // half of b in 50 s
+	assert.equal(fractionOverall(s).toFixed(3), "0.500");              // (1 finished + 0.5) / 3
+	assert.equal(Math.round(etaSeconds(s, T0 + 151_000)), 150);        // 50 s for the rest of b + one PDF averaging 100 s
+	assert.equal(statusBarText(s, T0 + 151_000), "PDF→MD: PDF 2/3 · 50% · ~3 min");
+	assert.equal(fractionOverall(feed(s, ["PROGRESS 20 20"], T0 + 200_000)).toFixed(3), "0.667");
+});
+
+test("errors are remembered and unknown lines change nothing", () => {
+	const s = initialState(T0, 1);
+	assert.equal(reduce(s, parseLine("some warning"), T0), s);
+	assert.equal(feed(s, ["error: cannot reach the server"], T0).lastError, "error: cannot reach the server");
+});
+
+test("formatDuration and the label read naturally", () => {
+	assert.equal(formatDuration(3), "3 s");
+	assert.equal(formatDuration(0.2), "1 s");
+	assert.equal(formatDuration(59.6), "60 s");
+	assert.equal(formatDuration(61), "1 min");
+	assert.equal(formatDuration(600), "10 min");
+	assert.equal(formatDuration(5399), "90 min");
+	assert.equal(formatDuration(5400), "1 h 30 min");
+	assert.equal(formatDuration(7230), "2 h 1 min");
+	assert.equal(formatDuration(7199), "2 h");
 });
