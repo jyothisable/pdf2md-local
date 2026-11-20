@@ -127,8 +127,7 @@ single-page PDFs: a seeded sample of [olmOCR-bench](https://huggingface.co/datas
 all 8 of its categories (279 tests), scored with the benchmark's official scorer. Scores are % of tests passed.
 
 The table below records the **initial** configuration, before the resolution and table-text improvements.
-Follow-up tuning compares render scales on both the original table/multi-column pages and a separate page set.
-Until that completes, do not treat the best tuning score as a confirmed general ranking.
+See the follow-up results below for the improved configuration; do not mix scores from different page sets.
 
 | Engine (used by) | arXiv math | Tables | Multi-column | Old scans | Overall | s/PDF |
 |---|---|---|---|---|---|---|
@@ -149,12 +148,13 @@ per PDF (this tool, 20 s with Ollama). The overall scores carry about ±4 to ±6
 
 What this does and does not show:
 
-- **This tool is not the most accurate.** Marker 2 and MinerU 4 score higher overall, though the gaps to the
+- **The initial version was not the most accurate.** Marker 2 and MinerU 4 scored higher overall, though the gaps to the
   PaddleOCR-VL engine are within the uncertainty. They are clearly ahead of the Docling engine.
 - **Its strengths are narrower:** the PaddleOCR-VL engine has the best arXiv-maths score (93% against 84%), needs about
   3 GB of VRAM, and runs without Ollama. The Docling engine is strong on tables and on dropping headers and footers.
-- **Post-processing does not change these scores** (72.7 against 73.4 for the raw pipeline, one or two tests). What the
-  tool adds is Obsidian formatting: Markdown tables, `![[embeds]]`, page links, tidied headings, chapter notes.
+- **The initial post-processing made little difference to these scores** (72.7 against 73.4 for the raw pipeline).
+  Later improvements are measured separately below. The tool also adds Obsidian formatting: Markdown tables,
+  `![[embeds]]`, page links, tidied headings, chapter notes.
 - **Both engines are weak on old scans** (as is every engine here), and Docling's scan OCR is the main reason the
   Docling engine trails on scanned maths.
 - **Not tested:** the cloud engines some plugins call (Mistral OCR, Mathpix, MinerU's remote service), GLM-OCR, and
@@ -162,6 +162,47 @@ What this does and does not show:
 - This is a small sample of one-page documents, and one of my own earlier MinerU runs was invalid (a command-line
   change) until fixed. Run `tool/bench/run_olmocr_bench.py` to reproduce, or to test your own documents.
 
+
+### Follow-up: resolution and table-text improvements
+
+Two formatting fixes recover text that the evaluator—and Obsidian readers—otherwise see as literal LaTeX:
+bare unit macros such as `250 \mu M` become `250 µM`, and simple chemical/typographic spans such as `$CO_2$`
+become Unicode text. Ordinary mathematical expressions remain LaTeX.
+
+On the same 46-page set, these fixes plus rendering at **scale 2.5 (180 dpi)** changed the results:
+
+| Configuration | arXiv maths | Tables | Multi-column | Overall |
+|---|---:|---:|---:|---:|
+| Initial Paddle engine | 93.0% | 64.0% | 71.4% | 72.7% |
+| Improved Paddle engine, scale 2.5 | 94.7% | 76.0% | 81.0% | 80.2% |
+| Marker balanced, reference run | 84.2% | 84.0% | 76.2% | 79.8% |
+
+**80.2% versus 79.8% is not evidence that this tool beats Marker:** the overall uncertainty is approximately
+±5 points, and we repeatedly used this small set during development.
+
+We then compared resolutions on the original 12 table/multi-column pages and 12 additional pages. The additional
+pages were initially separate from tuning, but were subsequently used to select the resolution too; they are
+therefore **validation/development data, not an untouched final test set**. Combined results cover 55 table tests
+and 47 multi-column tests:
+
+| Render scale | Resolution | Tables | Multi-column | 60% tables + 40% multi-column |
+|---|---:|---:|---:|---:|
+| **4.0** | **288 dpi** | **89.1%** | 72.3% | **82.4** |
+| **2.5** | **180 dpi** | 83.6% | **76.6%** | **80.8** |
+| 3.25 | 234 dpi | 81.8% | 74.5% | 78.9 |
+| 3.5 | 252 dpi | 81.8% | 74.5% | 78.9 |
+| 3.75 | 270 dpi | 74.5% | 72.3% | 73.7 |
+| 2.75 | 198 dpi | 72.7% | 72.3% | 72.6 |
+
+**Recommendation:** keep **2.5 as the balanced default**; choose **4.0 when tables matter more than multi-column
+text** (`--paddle-scale 4`, or *Page resolution → Tables* in the plugin). Higher resolution is not monotonically
+better. The table-priority weighting is a preference, not a standard benchmark metric, and the lead is small.
+This does not establish the optimal scale for every PDF, GPU or language.
+
+The investigated failures did not show missing table tails from token truncation. They included mistranscribed
+names, incorrectly merged rows and literal LaTeX units. Several multi-column test failures were text/OCR
+mismatches rather than incorrect reading order. Disabling layout-block merging did not improve the tested pages.
+No benchmark-specific names, expected answers or spelling corrections were added to the converter.
 
 ## Limitations
 
