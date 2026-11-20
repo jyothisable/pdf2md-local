@@ -1187,7 +1187,7 @@ class PaddleSliceTests(unittest.TestCase):
     def fake_worker(self, d, body):
         f = Path(d) / "fake_worker.py"
         f.write_text(body)
-        return lambda pdf, rng, server, out: [sys.executable, str(f), str(out), str(rng[0]), str(rng[1]), server]
+        return lambda pdf, rng, server, out, scale=2.5: [sys.executable, str(f), str(out), str(rng[0]), str(rng[1]), server]
 
     WORKER = (
         "import sys\nfrom pathlib import Path\n"
@@ -1238,6 +1238,9 @@ class PaddleSliceTests(unittest.TestCase):
         self.assertEqual(cmd[:4], ["uv", "run", "--python", "3.12"])
         self.assertTrue(cmd[4].endswith("paddle_worker.py") and Path(cmd[4]).exists())
         self.assertEqual(cmd[cmd.index("--first") + 1:cmd.index("--first") + 4], ["5", "--last", "9"])
+        self.assertEqual(cmd[cmd.index("--scale") + 1], "2.5")
+        high = m.worker_command(Path("/x/a.pdf"), (1, 2), "http://s/v1", Path("/o"), 4.0)
+        self.assertEqual(high[high.index("--scale") + 1], "4.0")
 
 
 class PaddleEngineMainTests(unittest.TestCase):
@@ -1255,7 +1258,7 @@ class PaddleEngineMainTests(unittest.TestCase):
             def __exit__(self, *a):
                 seen["guards"].append("exit")
 
-        def fake_slice(pdf, rng, assets, server, page_links, on_page=None):
+        def fake_slice(pdf, rng, assets, server, page_links, on_page=None, scale=2.5):
             seen["slices"].append((rng, server, page_links))
             for i in range(1, rng[1] - rng[0] + 2):      # the worker reports every page
                 if on_page:
@@ -1310,6 +1313,64 @@ class PaddleEngineMainTests(unittest.TestCase):
             self.assertEqual(names, ["00 Index.md", "01 One.md", "02 Two.md"])
 
 
+class LightMathTests(unittest.TestCase):
+    def test_typography_becomes_plain_characters(self):
+        f = m.simplify_inline_math
+        self.assertEqual(f(" CO_{2} "), "CO\u2082")
+        self.assertEqual(f("CO_2"), "CO\u2082")
+        self.assertEqual(f("NO_{x}"), "NO\u2093")
+        self.assertEqual(f("H_{2}O"), "H\u2082O")
+        self.assertEqual(f("N_2"), "N\u2082")
+        self.assertEqual(f(" _{2} "), "\u2082")
+        self.assertEqual(f("^{rd}"), "\u02b3\u1d48")
+        self.assertEqual(f("10^{-3}"), "10\u207b\u00b3")
+        self.assertEqual(f(r" \pm "), "\u00b1")
+        self.assertEqual(f(r"\leq 5"), "\u2264 5")
+        self.assertEqual(f(r"\mu"), "\u00b5")
+
+    def test_ordinary_maths_is_left_alone(self):
+        f = m.simplify_inline_math
+        for keep in ("K_k", "H_{k}", "R_{n}", "x_i", "B^4", "I_{CaL}", "CO_{abc}", "a^2 + b^2", r"\frac{1}{2}", "x", "10_2",
+                     "^{*}", r"\alpha_{1}", "CO^2", r"\unknown", "e^{x}", "H_2 O_2 = 3"):
+            self.assertIsNone(f(keep), keep)
+
+    def test_applied_to_spans_outside_code_and_display_maths(self):
+        md = "Burning $ CO_{2} $ and $K_k$ on the 3 $ ^{rd} $ day, $ \\pm $ 5.\n\n$$ CO_{2} $$\n\n```\n$CO_2$\n```\n"
+        out = m.simplify_light_math(md)
+        self.assertIn("Burning CO\u2082 and $K_k$ on the 3\u02b3\u1d48 day, \u00b1 5.", out)
+        self.assertIn("$$ CO_{2} $$", out)
+        self.assertIn("```\n$CO_2$\n```", out)
+        self.assertEqual(m.simplify_light_math(out), out)                      # idempotent
+
+    def test_flows_through_the_cleaner_including_table_cells(self):
+        out = m.clean_paddle_markdown("<table><tr><td>[SO $ _{2} $]</td><td>[NO $ _{x} $]</td></tr></table>\n\nBurns  $ CO_{2} $.", 1, None, None)
+        self.assertIn("| [SO\u2082] | [NO\u2093] |", out)
+        self.assertIn("Burns CO\u2082.", out)
+
+
+class TextMacroTests(unittest.TestCase):
+    def test_units_and_symbols_in_text(self):
+        f = m.text_macros_to_unicode
+        self.assertEqual(f(r"250 \mu M and 0 \mu M"), "250 \u00b5M and 0 \u00b5M")      # TeX eats the space after a macro
+        self.assertEqual(f(r"\pm 5 and 3 \times 10 and x \le 5, y \geq 2"), "\u00b1 5 and 3 \u00d7 10 and x \u2264 5, y \u2265 2")
+        self.assertEqual(f(r"\alpha-helix, \beta sheet, \Delta T"), "\u03b1-helix, \u03b2 sheet, \u0394 T")
+        self.assertEqual(f(r"50\% of A\&B, a\_b"), "50% of A&B, a_b")
+        self.assertEqual(f(r"20 \degree C"), "20 \u00b0 C")
+
+    def test_math_code_and_longer_macros_are_left_alone(self):
+        f = m.text_macros_to_unicode
+        for keep in (r"$250 \mu M$", r"$$ a \le b $$", r"a \leftarrow b", r"\midpoint", r"\leq5".replace("\\leq5", "\\lex")):
+            self.assertEqual(f(keep), keep, keep)
+        self.assertEqual(f("a \\mu b $x \\mu$ c \\le d"), "a \u00b5b $x \\mu$ c \u2264 d")   # text around a span is converted, the span is not
+        self.assertEqual(f("```\n\\mu\n```\n\\mu"), "```\n\\mu\n```\n\u00b5")
+
+    def test_table_cells_and_the_full_cleaner(self):
+        html = "<table><tr><td>[CO]</td><td>[NO $ _{x} $]</td></tr><tr><td>250 \\mu M</td><td>0.005 nM</td></tr></table>"
+        out = m.clean_paddle_markdown(html, 1, None, None)
+        self.assertIn("| 250 \u00b5M | 0.005 nM |", out)
+        self.assertIn("[NO\u2093]", out)                                      # typographic maths in a cell becomes text
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1343,7 +1404,7 @@ class ProgressLineTests(unittest.TestCase):
         self.assertEqual(got, ["PROGRESS 0 20", "PROGRESS 10 20", "PROGRESS 20 20"])
 
     def test_paddle_reports_every_page_with_the_slice_offset(self):
-        def fake(pdf, rng, assets, server, page_links, on_page=None):
+        def fake(pdf, rng, assets, server, page_links, on_page=None, scale=2.5):
             for i in range(1, rng[1] - rng[0] + 2):
                 on_page(i, rng[1] - rng[0] + 1)
             return "t\n", m.new_stats()

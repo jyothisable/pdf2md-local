@@ -28,7 +28,8 @@ def main() -> None:
     ap.add_argument("--last", type=int, default=10**6)
     ap.add_argument("--server", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--scale", type=float, default=2.0, help="page render scale (2.0 = 144 dpi)")
+    ap.add_argument("--scale", type=float, default=2.5,
+                    help="page render scale (2.5 = 180 dpi)")
     a = ap.parse_args()
 
     import pypdfium2

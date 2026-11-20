@@ -103,6 +103,7 @@ test("buildArgs: the PaddleOCR-VL engine passes the server and nothing about mod
 	const a = buildArgs("/s.py", "/v/a.pdf", s, undefined, "5-9");
 	assert.equal(a[a.indexOf("--engine") + 1], "paddleocr-vl");
 	assert.equal(a[a.indexOf("--paddle-server") + 1], "http://127.0.0.1:8111/v1");
+	assert.equal(a[a.indexOf("--paddle-scale") + 1], "2.5");
 	assert.equal(a[a.indexOf("--serve-command") + 1], "/x/serve.sh");
 	assert.ok(a.includes("--split-chapters") && a.includes("--page-links"));
 	assert.equal(a[a.indexOf("--pages") + 1], "5-9");

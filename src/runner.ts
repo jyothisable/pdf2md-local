@@ -23,6 +23,8 @@ export interface Settings {
 	engine: Engine;
 	/** The llama-server running PaddleOCR-VL (engine paddleocr-vl). */
 	paddleServer: string;
+	/** Raster scale: 2.5 = 180 dpi; 4 = 288 dpi (table-heavy PDFs). */
+	paddleScale: number;
 	/** Command that starts that server if nothing answers; the tool stops it again when done. */
 	serveCommand: string;
 	pageLinks: PageLinks;
@@ -61,6 +63,7 @@ export const DEFAULT_SETTINGS: Settings = {
 	visionHost: "",
 	engine: "docling",
 	paddleServer: "http://127.0.0.1:8111/v1",
+	paddleScale: 2.5,
 	serveCommand: "",
 	pageLinks: "auto",
 	equationFlags: true,
@@ -113,6 +116,8 @@ export function buildArgs(script: string, pdfAbs: string | string[], s: Settings
 	if (s.engine === "paddleocr-vl") {
 		// PaddleOCR-VL reads the pages itself: no model flags, and the tool picks its own (larger) slice size
 		args.push("--engine", "paddleocr-vl", "--paddle-server", s.paddleServer.trim() || DEFAULT_SETTINGS.paddleServer);
+		const scale = Number.isFinite(s.paddleScale) ? Math.min(4, Math.max(1, s.paddleScale)) : 2.5;
+		args.push("--paddle-scale", String(scale));
 		if (s.serveCommand.trim()) args.push("--serve-command", s.serveCommand.trim());
 	} else {
 		if (!s.useLlm) {

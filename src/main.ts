@@ -733,6 +733,10 @@ class Pdf2MdSettingTab extends PluginSettingTab {
 
 		if (s.engine === "paddleocr-vl") {
 			new Setting(containerEl).setName("PaddleOCR-VL server").setHeading();
+			new Setting(containerEl).setName("Page resolution")
+				.setDesc("Balanced: 180 dpi. High resolution: 288 dpi, better on tables in the small test set but not consistently better on other pages.")
+				.addDropdown((d) => d.addOptions({ "2.5": "Balanced (180 dpi)", "4": "Tables (288 dpi)" })
+					.setValue(String(s.paddleScale)).onChange(async (v) => { s.paddleScale = Number(v); await save(); }));
 			containerEl.createEl("p", {
 				text: "Runs the PaddleOCR-VL-1.6 model with llama.cpp's llama-server. The plugin folder contains serve-paddleocr-vl.sh in the project's tool folder to download the model and start the server; see the README.",
 			});

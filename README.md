@@ -6,6 +6,26 @@ online service unless you point it at one.
 
 It ships as an Obsidian plugin and as a standalone command-line tool (`pdf2md`), with two interchangeable engines.
 
+## Why choose it for a local 8–16 GB GPU?
+
+**A strong fit for private, maths-heavy reading—not a claim to be the best parser for every document.**
+
+- **Small OCR model, not a large general-purpose chatbot.** PaddleOCR-VL-1.6 is a 0.9B model served directly by
+  llama.cpp. The tested server setup used roughly 3 GB of VRAM; layout analysis runs on the CPU.
+- **8 GB VRAM:** the measured footprint suggests useful headroom, without needing a 12B model or Ollama. This is
+  an estimate from a 16 GB GPU, **not a test on an 8 GB card**. Resolution, context size, concurrency and other GPU
+  applications can increase memory use. Reduce server slots if memory is tight.
+- **16 GB VRAM:** this is the tested configuration. The small Paddle model leaves room rather than requiring the
+  larger Docling-plus-Gemma setup, which used about 10 GB for its model server.
+- **Built for studying locally.** Editable inline/display LaTeX, source-page links, chapter notes, batch conversion,
+  checkpoints, and a progress window with background operation and ETA—not just an OCR text dump.
+- **No per-page service charge or document upload** when using the local setup. Downloads, GPU time, electricity
+  and system RAM are still required. The test machine had about 30 GB of system RAM; VRAM is not the whole budget.
+
+Marker and MinerU are strong local alternatives and scored higher overall in the initial comparison below.
+Our strongest measured category was arXiv maths. Choose based on your documents, memory budget and workflow;
+this project does not establish an accuracy or speed advantage on every 8 GB or 16 GB machine.
+
 ## Engines
 
 | | **PaddleOCR-VL-1.6** | **Docling + a vision model** |
@@ -91,6 +111,7 @@ the book's index) opens. The first run downloads Python packages and models and 
 tool/pdf2md paper.pdf                              # paper.md next to the PDF (Docling engine, Ollama)
 tool/pdf2md a.pdf b.pdf c.pdf -o out/              # a batch, one after another
 tool/pdf2md book.pdf --engine paddleocr-vl --split-chapters
+tool/pdf2md book.pdf --engine paddleocr-vl --paddle-scale 4   # higher resolution for table-heavy PDFs
 tool/pdf2md book.pdf --pages 60-79                 # only some pages
 tool/pdf2md paper.pdf --api openai --host http://localhost:8080 --vision-model any-name   # llama-server, LM Studio, vLLM
 tool/pdf2md --help
@@ -103,7 +124,11 @@ choice first: set `PDF2MD_BACKUP_COMMAND` or pass `--backup-command`. Nothing is
 
 I ran the engines the Obsidian plugins in this space are built on, plus this tool's two engines, on the same 46
 single-page PDFs: a seeded sample of [olmOCR-bench](https://huggingface.co/datasets/allenai/olmOCR-bench) covering
-all 8 of its categories (350 tests), scored with the benchmark's official scorer. Scores are % of tests passed.
+all 8 of its categories (279 tests), scored with the benchmark's official scorer. Scores are % of tests passed.
+
+The table below records the **initial** configuration, before the resolution and table-text improvements.
+Follow-up tuning compares render scales on both the original table/multi-column pages and a separate page set.
+Until that completes, do not treat the best tuning score as a confirmed general ranking.
 
 | Engine (used by) | arXiv math | Tables | Multi-column | Old scans | Overall | s/PDF |
 |---|---|---|---|---|---|---|

@@ -1317,6 +1317,105 @@ def html_table_to_md(table_html: str) -> str | None:
     return "\n".join(lines)
 
 
+# Bare LaTeX in running text and table cells ("250 \mu M", "\pm 5") is shown literally by Obsidian: use the characters.
+TEXT_MACROS = {
+    "mu": "\u00b5", "alpha": "\u03b1", "beta": "\u03b2", "gamma": "\u03b3", "delta": "\u03b4", "epsilon": "\u03b5",
+    "theta": "\u03b8", "lambda": "\u03bb", "pi": "\u03c0", "rho": "\u03c1", "sigma": "\u03c3", "tau": "\u03c4",
+    "phi": "\u03c6", "omega": "\u03c9", "Delta": "\u0394", "Omega": "\u03a9", "Sigma": "\u03a3", "Gamma": "\u0393",
+    "pm": "\u00b1", "times": "\u00d7", "cdot": "\u00b7", "le": "\u2264", "leq": "\u2264", "ge": "\u2265", "geq": "\u2265",
+    "neq": "\u2260", "approx": "\u2248", "degree": "\u00b0", "circ": "\u00b0",
+}
+_MACRO = re.compile(r"\\(" + "|".join(sorted(TEXT_MACROS, key=len, reverse=True)) + r")(?![A-Za-z])( (?=[A-Za-z]))?")
+_ESCAPED = re.compile(r"\\([%&_#])")
+_MATH_SPAN = re.compile(r"(\$\$.*?\$\$|(?<![\\$])\$(?!\$)[^\n$]+?(?<![\\$])\$(?!\$))", re.S)
+
+
+def _macro_text(m: re.Match) -> str:
+    # TeX swallows the space after a control word; keep that only for units ("250 \\mu M" -> "250 µM")
+    return TEXT_MACROS[m.group(1)] + (" " if m.group(2) and m.group(1) != "mu" else "")
+
+
+def text_macros_to_unicode(md: str) -> str:
+    """Replace bare LaTeX macros outside math and code with the characters they stand for."""
+    out, in_code = [], False
+    for line in md.split("\n"):
+        if line.strip().startswith(("```", "~~~")):
+            in_code = not in_code
+        if in_code or "\\" not in line:
+            out.append(line)
+            continue
+        parts = _MATH_SPAN.split(line)               # odd items are the math spans, untouched
+        for i in range(0, len(parts), 2):
+            parts[i] = _ESCAPED.sub(r"\1", _MACRO.sub(_macro_text, parts[i]))
+        out.append("".join(parts))
+    return "\n".join(out)
+
+
+SUBSCRIPTS = dict(zip("0123456789+-=()aehijklmnoprstuvx", "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089\u208a"
+                      "\u208b\u208c\u208d\u208e\u2090\u2091\u2095\u1d62\u2c7c\u2096\u2097\u2098\u2099\u2092\u209a\u1d63\u209b"
+                      "\u209c\u1d64\u1d65\u2093"))
+SUPERSCRIPTS = dict(zip("0123456789+-=()nirdths", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207a\u207b\u207c"
+                        "\u207d\u207e\u207f\u2071\u02b3\u1d48\u1d57\u02b0\u02e2"))
+_SCRIPT = re.compile(r"([_^])(?:\{([^{}]{1,4})\}|([A-Za-z0-9]))")
+_SCRIPTED = re.compile(r"(?P<base>[A-Z]{1,4}|\d+)?\s*(?P<scripts>(?:[_^](?:\{[^{}]{1,4}\}|[A-Za-z0-9])\s*)+)(?P<tail>[A-Z][a-z]?)?")
+_LONE_MACRO = re.compile(r"\\(\w+)(?:\s*([0-9]+(?:\.[0-9]+)?))?")
+
+
+def simplify_inline_math(body: str) -> str | None:
+    """Plain characters for inline maths that is really typography (CO2, 10^-3, 3rd, a lone plus-minus sign).
+
+    Deliberately narrow: ordinary maths such as K_k, H_k, x_i or B^4 returns None and stays LaTeX.
+    """
+    b = body.strip()
+    m = _LONE_MACRO.fullmatch(b)
+    if m and m.group(1) in TEXT_MACROS:
+        return TEXT_MACROS[m.group(1)] + (f" {m.group(2)}" if m.group(2) else "")
+    m = _SCRIPTED.fullmatch(b)
+    if not m:
+        return None
+    base, tail = m.group("base") or "", m.group("tail") or ""
+    out = []
+    for kind, braced, bare in _SCRIPT.findall(m.group("scripts")):
+        arg = braced or bare
+        table = SUBSCRIPTS if kind == "_" else SUPERSCRIPTS
+        if not arg or any(c not in table for c in arg):
+            return None
+        if base and re.fullmatch(r"\d+", base):
+            if kind != "^":                         # 10_2 is not typography
+                return None
+        elif len(base) == 1:                        # H_2, N_2, O_2: a digit subscript on one capital letter
+            if kind != "_" or not arg.isdigit():
+                return None
+        elif len(base) >= 2:                        # CO_2, NO_x: a chemical formula, digit or x subscript
+            if kind != "_" or not (arg.isdigit() or arg == "x"):
+                return None
+        elif kind == "^" and not arg.isalpha() and not arg.lstrip("+-").isdigit():
+            return None
+        out.append("".join(table[c] for c in arg))
+    return base + "".join(out) + tail
+
+
+def simplify_light_math(md: str) -> str:
+    """Apply simplify_inline_math to every single-dollar span outside code; display maths is never touched."""
+    out, in_code = [], False
+    for line in md.split("\n"):
+        if line.strip().startswith(("```", "~~~")):
+            in_code = not in_code
+        if in_code or "$" not in line:
+            out.append(line)
+            continue
+        parts = _MATH_SPAN.split(line)
+        for i in range(1, len(parts), 2):
+            if not parts[i].startswith("$$"):
+                plain = simplify_inline_math(parts[i][1:-1])
+                if plain is not None:
+                    parts[i] = plain
+                    if all(c in SUBSCRIPTS.values() or c in SUPERSCRIPTS.values() for c in plain):
+                        parts[i - 1] = parts[i - 1].rstrip(" ")      # "SO $_2$" -> "SO\u2082", "3 $^{rd}$" -> "3\u02b3\u1d48"
+        out.append("".join(parts))
+    return "\n".join(out)
+
+
 _TABLE = re.compile(r"<table\b.*?</table>", re.S | re.I)
 _DIV = re.compile(r"<div\b[^>]*>\s*(.*?)\s*</div>", re.S | re.I)
 _IMG = re.compile(r"<img\b[^>]*?\bsrc=[\"']([^\"']+)[\"'][^>]*>", re.I)
@@ -1338,7 +1437,7 @@ def clean_paddle_markdown(md: str, page_no: int, src_dir: Path | None, assets_di
         shutil.copy2(src_dir / src, assets_dir / name)
         return f"![[{name}]]"
 
-    md = _IMG.sub(img, md)
+    md = simplify_light_math(text_macros_to_unicode(_IMG.sub(img, md)))
     out, in_code = [], False
     for line in md.split("\n"):
         if line.strip().startswith(("```", "~~~")):
@@ -1401,17 +1500,17 @@ class ServerGuard:
         self.proc = None
 
 
-def worker_command(pdf: Path, rng: tuple[int, int], server: str, out: Path) -> list[str]:
+def worker_command(pdf: Path, rng: tuple[int, int], server: str, out: Path, scale: float = 2.5) -> list[str]:
     return ["uv", "run", "--python", "3.12", str(WORKER), "--pdf", str(pdf), "--first", str(rng[0]),
-            "--last", str(rng[1]), "--server", server, "--out", str(out)]
+            "--last", str(rng[1]), "--server", server, "--out", str(out), "--scale", str(scale)]
 
 
 def paddle_slice(pdf: Path, page_range: tuple[int, int], assets_dir: Path, server: str, page_links: bool,
-                 on_page: Callable[[int, int], None] | None = None) -> tuple[str, dict]:
+                 on_page: Callable[[int, int], None] | None = None, scale: float = 2.5) -> tuple[str, dict]:
     """Convert one page slice with the PaddleOCR-VL worker; on_page(n, total) is called as each page finishes."""
     stats = new_stats()
     with tempfile.TemporaryDirectory() as tmp:
-        proc = subprocess.Popen(worker_command(pdf, page_range, server, Path(tmp)), stdout=subprocess.PIPE,
+        proc = subprocess.Popen(worker_command(pdf, page_range, server, Path(tmp), scale), stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True)
         bad: list[int] = []
         for line in proc.stdout:
@@ -1514,7 +1613,7 @@ def convert_pdf(a: argparse.Namespace, pdf: Path) -> None:
     first, last = parse_pages(a.pages, total)
     key = run_key(pdf, not a.no_ocr, use_vision, vmodel, a.model, bool(ask_fig), bool(ask_inline),
                   batch_pages, a.num_ctx, a.no_llm, a.inline_math, first, last, a.engine, clean_mode,
-                  a.api, a.vision_api, a.vision_host, page_links, flag_doubt, need_text)
+                  a.api, a.vision_api, a.vision_host, page_links, flag_doubt, need_text, a.paddle_scale)
     cache_dir = Path(tempfile.mkdtemp(prefix="pdf2md-")) if a.no_cache else CACHE_ROOT / key
     cache = Cache(cache_dir)
 
@@ -1561,7 +1660,7 @@ def convert_pdf(a: argparse.Namespace, pdf: Path) -> None:
                 failed_here: list[int] = []
                 if paddle_engine:
                     convert_fn = lambda r: paddle_slice(pdf, r, cache.img, a.paddle_server, page_links,
-                                                        lambda i, _t, r=r: progress(r[0] - first + i))
+                                                        lambda i, _t, r=r: progress(r[0] - first + i), a.paddle_scale)
                 else:
                     if conv is None:
                         conv = make_converter(not a.no_ocr, use_vision)
@@ -1703,6 +1802,8 @@ def main() -> None:
     ap.add_argument("--paddle-server", default=os.environ.get("PDF2MD_PADDLE_SERVER", DEFAULT_PADDLE_SERVER),
                     help="address of the llama-server running PaddleOCR-VL (default: $PDF2MD_PADDLE_SERVER, "
                          f"{DEFAULT_PADDLE_SERVER})")
+    ap.add_argument("--paddle-scale", type=float, default=float(os.environ.get("PDF2MD_PADDLE_SCALE", "2.5")),
+                    help="page render scale: 2.5 (180 dpi, balanced default), 4 (288 dpi, table-heavy PDFs)")
     ap.add_argument("--serve-command", default=os.environ.get("PDF2MD_SERVE_COMMAND"),
                     help="command that starts that server; run only if nothing answers, stopped when done "
                          "(default: $PDF2MD_SERVE_COMMAND; see serve-paddleocr-vl.sh)")
@@ -1732,6 +1833,8 @@ def main() -> None:
     ap.add_argument("--keep-cache", action="store_true", help="keep the checkpoint folder after success")
     ap.add_argument("--timeout", type=int, default=600, help="seconds per Ollama call")
     a = ap.parse_args()
+    if not 1 <= a.paddle_scale <= 4:
+        ap.error("--paddle-scale must be between 1 and 4")
 
     pdfs = [p.expanduser().resolve() for p in a.pdf]
     bad = [str(p) for p in pdfs if not p.is_file() or p.suffix.lower() != ".pdf"]
