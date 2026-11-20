@@ -1070,7 +1070,7 @@ class PaddleMarkdownTests(unittest.TestCase):
 
     def test_simple_table_becomes_markdown(self):
         out = m.html_table_to_md(self.TABLE)
-        self.assertEqual(out.split("\n"), ["| Type | Fall |", "| --- | --- |", "| Domestic \\| US | Jan 15 |"])
+        self.assertEqual(out.split("\n"), ["| Type | Fall |", "| --- | --- |", "| Domestic \\| US | Jan<br>15 |"])
 
     def test_merged_cells_are_left_as_html_and_ragged_rows_padded(self):
         self.assertIsNone(m.html_table_to_md("<table><tr><td colspan='2'>A</td></tr><tr><td>b</td><td>c</td></tr></table>"))

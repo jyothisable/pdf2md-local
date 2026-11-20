@@ -45,6 +45,22 @@ splitting, and resumable, never-overwriting output.
 - **Checked LaTeX.** Maths is validated before it is written. With the Docling engine, an equation the model cannot
   produce validly falls back to a picture instead of broken LaTeX, and one that looks cut off gets a collapsed
   "check this equation against the PDF" callout holding its source picture.
+- **Source-backed Paddle safeguards.** Structurally broken equations get bounded, higher-resolution crop retries;
+  uncertain results and complex annotated formulas are preserved as exact PDF crops instead of guessed maths.
+  Candidate retries reject truncated API answers, nested math delimiters, unmatched literal brackets and numerical
+  values added or omitted relative to a readable native source rectangle. Matrix/vector numeric multiplicities
+  are also checked against the native crop, so a repeated extra entry can trigger recovery even when TeX renders.
+  Clear native Greek glyphs help reject symbol substitutions; ambiguous mathematical font encodings are not
+  treated as reliable evidence. Retries also check native variable case/multiplicities; missing or substituted
+  clear source operators (for example proportionality versus infinity) retain source pixels rather than a guess.
+  Repeated margin titles are removed only when an earlier bookmark destination
+  and neighboring-page header text corroborate them, preserving real titles on their bookmarked page.
+  This is not a proof of mathematical equivalence. Mixed-panel figures
+  detected beneath one caption retain a complete source image rather than fragments misread as tables/equations.
+  High-overlap, well-encoded native prose blocks replace OCR inventions, including invented page-end sentence
+  completions. Broken inline maths uses well-aligned native prose when safe, otherwise an exact paragraph crop;
+  intact mathematical prose and scans keep the OCR fallback. Table cell line breaks are retained as `<br>`.
+  A cropped formula is faithful but **not editable LaTeX**. Unflagged OCR can still contain semantic errors.
 - **Links back to the PDF.** A `[[book.pdf#page=N|p. N]]` link under each heading when the PDF is in your vault.
 - **Books.** *Split books into chapters* writes a folder: an index, front matter, one note per chapter with
   Previous / Contents / Next links, and the bibliography and index as their own notes.
@@ -133,13 +149,15 @@ I ran the engines the Obsidian plugins in this space are built on, plus this too
 single-page PDFs: a seeded sample of [olmOCR-bench](https://huggingface.co/datasets/allenai/olmOCR-bench) covering
 all 8 of its categories (279 tests), scored with the benchmark's official scorer. Scores are % of tests passed.
 
-The improved configurations appear first, followed by the initial comparison runs. Every row uses the same
-46-page set. See the follow-up section for the separate, larger table/multi-column comparison.
+The current source-guarded configuration appears first, followed by earlier configurations and reference runs.
+Every row uses the same 46-page set; historical rows use earlier tool versions. See the follow-up section for the
+separate, larger table/multi-column comparison.
 
 | Engine (used by) | arXiv math | Tables | Multi-column | Old scans | Overall | s/PDF |
 |---|---|---|---|---|---|---|
-| **This tool, improved Paddle — balanced, scale 2.5** | **94.7** | **76.0** | **81.0** | **45.2** | **80.2** | **7** |
-| **This tool, improved Paddle — tables priority, scale 4.0** | **91.2** | **88.0** | **76.2** | **41.9** | **77.6** | **8** |
+| **This tool, current source-guarded Paddle — default, scale 2.5** | **91.2** | **76.0** | **85.7** | **38.7** | **79.6** | **6** |
+| This tool, earlier improved Paddle — balanced, scale 2.5 | 94.7 | 76.0 | 81.0 | 45.2 | **80.2** | 7 |
+| **This tool, earlier improved Paddle — tables priority, scale 4.0** | **91.2** | **88.0** | **76.2** | **41.9** | **77.6** | **8** |
 | Marker 2, balanced (OCR-AI) | 84.2 | 84.0 | 76.2 | 45.2 | **79.8** | 8 |
 | MinerU 4, standard tier (MinerU plugins) | 84.2 | 60.0 | 76.2 | 45.2 | **76.1** | 3 |
 | PaddleOCR-VL-1.6 pipeline, raw | 93.0 | 64.0 | 71.4 | 41.9 | **73.4** | 5 |
@@ -153,17 +171,28 @@ The improved configurations appear first, followed by the initial comparison run
 
 The overall column is the average over all 8 categories (the other four are in `tool/bench`). Times are per PDF on
 one RTX 5060 Ti; engines that load once and loop (Marker, MinerU, raw Paddle) are faster per page than ones started
-per PDF (this tool, 20 s with Ollama). The overall scores carry about ±4 to ±6 points of uncertainty.
+per PDF (this tool, 20 s with Ollama). Overall confidence intervals vary by run: the current guarded result is
+**79.6% ±3.6 points**, versus 80.2% ±4.7 for the earlier balanced version and 79.8% ±4.9 for Marker. Times are rounded;
+the current mean is 6.48 s/PDF. These were not controlled speed-comparison trials.
+
+The current row is **one complete final rerun and scoring pass**, after source-fidelity repairs. A preliminary
+attempt was stopped before scoring when a separate book audit exposed another equation error. The final run
+converted all 46 PDFs successfully; its runtime code hashes and exact results are recorded in
+[`tool/bench/results/source_guarded25_20261120.json`](tool/bench/results/source_guarded25_20261120.json).
+**79.6% is not an overall accuracy improvement over 80.2%.** Multi-column checks improved, tables were unchanged,
+and arXiv maths and old scans declined. Correct source-image fallbacks do not count as recognized LaTeX.
 
 **Pick scale 2.5 for balanced use, or scale 4.0 when tables take priority.** Scale 4.0 improves table accuracy but
 does not win overall. Its 88.0% above is on the original 25 table checks; the 89.1% later in this README combines
-55 table checks across two page sets and must not be substituted into this table.
+55 table checks across two page sets and must not be substituted into this table. The scale-4 and pooled resolution
+results predate the source guards; scale 4.0 has not been rerun with the current safeguards.
 
 What this does and does not show:
 
 - **The initial version was not the most accurate.** Marker 2 and MinerU 4 scored higher overall, though the gaps to the
   PaddleOCR-VL engine are within the uncertainty. They are clearly ahead of the Docling engine.
-- **Its strengths are narrower:** the PaddleOCR-VL engine has the best arXiv-maths score (93% against 84%), needs about
+- **Its strengths are narrower:** the current guarded Paddle engine passed 91.2% of the arXiv-maths tests versus
+  84.2% for the tested Marker and MinerU configurations, needs about
   3 GB of VRAM, and runs without Ollama. The Docling engine is strong on tables and on dropping headers and footers.
 - **The initial post-processing made little difference to these scores** (72.7 against 73.4 for the raw pipeline).
   Later improvements are measured separately below. The tool also adds Obsidian formatting: Markdown tables,
@@ -176,7 +205,7 @@ What this does and does not show:
   change) until fixed. Run `tool/bench/run_olmocr_bench.py` to reproduce, or to test your own documents.
 
 
-### Follow-up: resolution and table-text improvements
+### Historical follow-up: resolution and table-text improvements
 
 Two formatting fixes recover text that the evaluator—and Obsidian readers—otherwise see as literal LaTeX:
 bare unit macros such as `250 \mu M` become `250 µM`, and simple chemical/typographic spans such as `$CO_2$`
@@ -217,6 +246,26 @@ names, incorrectly merged rows and literal LaTeX units. Several multi-column tes
 mismatches rather than incorrect reading order. Disabling layout-block merging did not improve the tested pages.
 No benchmark-specific names, expected answers or spelling corrections were added to the converter.
 
+### Source-fidelity development checks
+
+The source-backed safeguards were iterated on **33 distinct pages from two mathematical textbooks**: 17 pages
+with known issues, 10 different sample pages, and 6 additional pages selected with a fixed random seed. The samples
+were inspected against the PDF pages and reused during repairs, so these are **development checks, not an untouched
+accuracy evaluation**. Code extraction/execution was excluded from this review.
+
+- Final outputs had **0 structural/inline math warnings, 0 missing image targets, and 0 KaTeX errors across 297 math
+  spans**. Rendering checks do not establish mathematical equivalence or prove that every OCR error was found.
+- Five equations were recovered as editable LaTeX. Twenty uncertain formulas and one paragraph were preserved
+  as source images; one damaged composite figure was also restored as a complete image. All **22 new source crops
+  were checked pixel-for-pixel against the rendered PDF rectangles**.
+- The checks caught silent errors that parsing alone misses, including an extra matrix/vector entry and a
+  probability symbol misread as a Greek letter. Native font encodings can also be unreliable, and source-authored
+  typos are not silently rewritten. Minor hyphenation, bullet and footer artifacts may remain.
+
+This prioritizes faithful readable output over pretending every equation is valid editable TeX. Image fallbacks
+are not equivalent to recognized mathematical text, and a text/math benchmark may penalize them. They must not
+be counted as successful LaTeX recognition merely because the source picture is correct.
+
 ## Final comparison: when this tool is the better fit
 
 **Choose this tool when your goal is to turn maths-heavy PDFs into a usable local Obsidian library—not simply
@@ -225,8 +274,8 @@ strong measured maths recognition and a book-oriented workflow.
 
 | Your priority | Why choose PDF2MD? | What the evidence does not establish |
 |---|---|---|
-| Maths-heavy papers | The improved balanced configuration passed **94.7% of the 57 arXiv maths tests**, versus 84.2% for the tested Marker and MinerU configurations. | Not a claim about all equations, handwriting or languages; this subset was used during development. |
-| Table-heavy reading | The 288-dpi preset reached **89.1% on 55 table checks** across two page sets, versus 83.6% at 180 dpi. | Marker was not rerun on the additional pages, so this pooled result cannot establish a table-accuracy win over Marker. |
+| Maths-heavy papers | The current guarded configuration passed **91.2% of the 57 arXiv maths tests**, versus 84.2% for the tested Marker and MinerU configurations. | Not a claim about all equations, handwriting or languages; this subset was used during development, and some difficult formulas become images. |
+| Table-heavy reading | The earlier 288-dpi preset reached **89.1% on 55 table checks** across two page sets, versus 83.6% at 180 dpi. | Those pooled results predate the source guards. Marker was not rerun on the additional pages, so they cannot establish a table-accuracy win over Marker. |
 | An 8–16 GB local GPU | PaddleOCR-VL is a 0.9B model; the tested llama.cpp server used roughly **3 GB of VRAM**, without a large chatbot or Ollama. | Tested on a 16 GB card only. Fit on 8 GB is an inference from the footprint, not a measured speed or compatibility result. |
 | Studying whole books in Obsidian | Chapter notes, linked contents, Previous/Contents/Next navigation, PDF-page links, figures and editable maths are integrated into one workflow. | Other plugins may offer overlapping features; this is not a claim that these features are exclusive. |
 | Long local jobs | Batch conversion, checkpoint/resume, a progress window, ETA and background operation make lengthy conversions manageable. | UI behaviour and non-Linux platforms have not been comprehensively tested. |
@@ -251,7 +300,8 @@ linking books. Judge it on your own documents before committing a large library.
 ## Limitations
 
 - Models misread things. Check the equations you rely on, especially those flagged with a callout.
-- The PaddleOCR-VL engine does not caption figures or clean prose, and tables with merged cells stay as HTML.
+- The PaddleOCR-VL engine does not generate figure descriptions or generatively rewrite prose; source guards can
+  restore well-aligned native text. Tables with merged cells stay as HTML.
 - Old scans are hard for every tool; expect errors.
 - Docling's reading order on dense multi-column pages is its weak spot.
 - The first conversion needs a network connection to download packages and models.
