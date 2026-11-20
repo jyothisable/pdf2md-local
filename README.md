@@ -204,6 +204,37 @@ names, incorrectly merged rows and literal LaTeX units. Several multi-column tes
 mismatches rather than incorrect reading order. Disabling layout-block merging did not improve the tested pages.
 No benchmark-specific names, expected answers or spelling corrections were added to the converter.
 
+## Final comparison: when this tool is the better fit
+
+**Choose this tool when your goal is to turn maths-heavy PDFs into a usable local Obsidian library—not simply
+to obtain the highest general-purpose OCR score.** Its advantage is the combination of a small local model,
+strong measured maths recognition and a book-oriented workflow.
+
+| Your priority | Why choose PDF2MD? | What the evidence does not establish |
+|---|---|---|
+| Maths-heavy papers | The improved balanced configuration passed **94.7% of the 57 arXiv maths tests**, versus 84.2% for the tested Marker and MinerU configurations. | Not a claim about all equations, handwriting or languages; this subset was used during development. |
+| Table-heavy reading | The 288-dpi preset reached **89.1% on 55 table checks** across two page sets, versus 83.6% at 180 dpi. | Marker was not rerun on the additional pages, so this pooled result cannot establish a table-accuracy win over Marker. |
+| An 8–16 GB local GPU | PaddleOCR-VL is a 0.9B model; the tested llama.cpp server used roughly **3 GB of VRAM**, without a large chatbot or Ollama. | Tested on a 16 GB card only. Fit on 8 GB is an inference from the footprint, not a measured speed or compatibility result. |
+| Studying whole books in Obsidian | Chapter notes, linked contents, Previous/Contents/Next navigation, PDF-page links, figures and editable maths are integrated into one workflow. | Other plugins may offer overlapping features; this is not a claim that these features are exclusive. |
+| Long local jobs | Batch conversion, checkpoint/resume, a progress window, ETA and background operation make lengthy conversions manageable. | UI behaviour and non-Linux platforms have not been comprehensively tested. |
+| Privacy and ownership | Local inference, no per-page API bill, MIT-licensed project code, and a standalone CLI as well as an Obsidian plugin. | Other open-source tools also run locally. Model downloads, hardware and electricity still have costs; dependencies have their own licences. |
+
+### Which should you choose?
+
+- **PDF2MD:** a strong choice for a local, maths-focused Obsidian workflow on consumer hardware, especially when
+  chapter organisation and source links matter as much as extraction.
+- **Marker balanced:** a strong alternative for general extraction. It led the initial overall comparison and
+  remains effectively tied with the improved balanced PDF2MD configuration within the uncertainty.
+- **MinerU standard:** worth considering when throughput matters; it was the fastest high-quality engine in
+  the initial local comparison.
+- **Simple text-layer converters:** preferable for uncomplicated text documents when milliseconds and minimal
+  setup matter more than equations, scans and document structure.
+
+**Bottom line:** PDF2MD's strongest case is *local maths recognition plus study-ready Obsidian output with a small
+GPU footprint*. It is not proven to be the best OCR engine overall. The improvements bring its balanced score into
+the same range as the strongest measured alternative, while its workflow makes the results useful for reading and
+linking books. Judge it on your own documents before committing a large library.
+
 ## Limitations
 
 - Models misread things. Check the equations you rely on, especially those flagged with a callout.
