@@ -48,6 +48,13 @@ splitting, and resumable, never-overwriting output.
 - **Links back to the PDF.** A `[[book.pdf#page=N|p. N]]` link under each heading when the PDF is in your vault.
 - **Books.** *Split books into chapters* writes a folder: an index, front matter, one note per chapter with
   Previous / Contents / Next links, and the bibliography and index as their own notes.
+- **Bookmark-guided headings.** When a PDF has a usable outline, its physical page destinations, titles and
+  hierarchy guide heading repair before chapter splitting. Publisher wrappers and broken destination branches
+  are ignored; split titles are joined, lost chapter numbers restored, and over-promoted OCR subheadings nested
+  below their section. Existing words and finer numbered subsections are preserved. Ambiguous or missing
+  matches are reported and left unchanged. Hidden page comments support matching even with visible page links
+  disabled. PDFs without a usable outline retain the extraction-based fallback; bookmarks are not always complete
+  or correct, and this is not a guarantee of perfect document structure.
 - **Batch.** Convert several PDFs, a whole folder, or a page range, from the plugin or the command line.
 - **Tables** become Markdown tables (tables with merged cells stay as HTML, which Obsidian also renders).
 - **Safe on a vault.** It only creates new files, never overwrites one, resumes after an interruption, and a page that

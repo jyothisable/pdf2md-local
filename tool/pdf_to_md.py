@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10,<3.14"
-# dependencies = ["docling==2.150.1"]   # the version this tool is tested with
+# dependencies = ["docling==2.150.1", "pypdf>=6,<7"]
 # ///
 """Convert PDFs to Obsidian-flavoured Markdown with a local model.
 
@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import difflib
 import hashlib
 import html.parser
 import io
@@ -41,6 +42,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -607,6 +609,266 @@ def fix_headings(md: str) -> str:
 # ----------------------------------------------------------------------------
 # Splitting a book into chapter notes
 # ----------------------------------------------------------------------------
+def normalize_pdf_outline(raw: list, page_count: int) -> list[dict]:
+    """Ignore broken destination branches and publisher wrappers, not semantic levels.
+
+    Page numbers are physical, one-based PDF pages, never printed page labels.
+    Some PDFs contain a second outline tree whose destinations are all broken.
+    """
+    result, wrappers = [], []
+    invalid_level = None
+    previous_page = 0
+    for level, title, page in raw:
+        if invalid_level is not None:
+            if level > invalid_level:
+                continue
+            invalid_level = None
+        wrappers = [n for n in wrappers if n < level]
+        title = " ".join(title.split())
+        if not 1 <= page <= page_count:
+            invalid_level = level
+            continue
+        if page < previous_page:  # stale/non-document-order destinations are unsafe anchors
+            continue
+        previous_page = page
+        wrapper = re.fullmatch(r"(FM|Ch\d+|App|Notations|Index)_\d+P", title, re.I)
+        if wrapper:
+            wrappers.append(level)
+            if wrapper[1].lower() not in ("app", "notations"):
+                continue
+            title = "Appendix" if wrapper[1].lower() == "app" else "Notations"
+            depth = max(1, level - len(wrappers) + 1)
+        else:
+            if re.fullmatch(r"[A-Z]", title) or not title:
+                continue
+            depth = max(1, level - len(wrappers))
+        entry = {"level": min(6, depth), "title": title, "page": page}
+        if entry not in result:
+            result.append(entry)
+    return result
+
+
+def read_pdf_outline(pdf: Path) -> list[dict]:
+    from pypdf import PdfReader
+    from pypdf.errors import PdfReadError
+    raw = []
+    try:
+        with pdf.open('rb') as stream:
+            reader = PdfReader(stream)
+
+            def walk(items: list, level: int = 1) -> None:
+                for item in items:
+                    if isinstance(item, list):
+                        walk(item, level+1)
+                    else:
+                        try:
+                            page = reader.get_destination_page_number(item)
+                            page = page+1 if page is not None and page >= 0 else -1
+                        except (PdfReadError, ValueError, KeyError, TypeError):
+                            page = -1
+                        raw.append([level, str(item.get('/Title', '')), page])
+
+            walk(reader.outline)
+            return normalize_pdf_outline(raw, len(reader.pages))
+    except PdfReadError as exc:
+        raise ValueError('unreadable PDF outline') from exc
+
+
+def heading_key(text: str) -> tuple[str, str]:
+    """Keep a section number separately so similar titles cannot change chapter identity."""
+    text = re.sub(r"^#{1,6}\s+", "", text.strip())
+    number = re.match(r"^(\d+(?:\.\d+)*|[A-Z](?:\.\d+)+)[ .\t]+", text)
+    prefix = number[1] if number else ""
+    if number:
+        text = text[number.end():]
+    text = unicodedata.normalize("NFKD", text).casefold()
+    return prefix, "".join(c for c in text if c.isalnum())
+
+
+def repair_pdf_headings(md: str, outline: list[dict]) -> tuple[str, dict]:
+    """Conservative, auditable title matching using outline order and page locality.
+
+    Only heading spans are changed. Equations, fenced code, links and prose remain
+    untouched. Ambiguous/missing entries are reported, never inserted or guessed.
+    Sparse historical page links bound candidates; new Paddle output has per-page
+    comments even when visible PDF links are disabled.
+    """
+    lines = md.split("\n")
+    protected, anchors = set(), []
+    fence, math = None, False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        f = re.match(r"^(`{3,}|~{3,})", stripped)
+        if f:
+            protected.add(i)
+            if fence is None:
+                fence = f[1]
+            elif f[1][0] == fence[0] and len(f[1]) >= len(fence):
+                fence = None
+            continue
+        if fence:
+            protected.add(i)
+            continue
+        if stripped == "$$":
+            math = not math
+            protected.add(i)
+            continue
+        if math:
+            protected.add(i)
+            continue
+        a = re.search(r"<!-- pdf2md:page=(\d+) -->|\.pdf#page=(\d+)", line)
+        if a:
+            anchors.append((i, int(a[1] or a[2])))
+    if not anchors or not outline:
+        return md, {"matched": 0, "changes": [], "unmatched": outline, "ambiguous": [],
+                    "reason": "no page anchors" if not anchors else "no usable PDF bookmarks"}
+
+    # Linear-time page bounds; a nearby following link usually belongs to the heading.
+    previous, following = [], []
+    j, last = 0, None
+    for i in range(len(lines)):
+        while j < len(anchors) and anchors[j][0] <= i:
+            last = anchors[j]
+            j += 1
+        previous.append(last)
+    j, nxt = len(anchors)-1, None
+    for i in range(len(lines)-1, -1, -1):
+        while j >= 0 and anchors[j][0] >= i:
+            nxt = anchors[j]
+            j -= 1
+        following.append(nxt)
+    following.reverse()
+
+    def local(i: int, page: int) -> bool:
+        before, after = previous[i], following[i]
+        # An explicit page comment anchors all following text until the next page.
+        if before and "<!-- pdf2md:page=" in lines[before[0]]:
+            return before[1] == page
+        if after and after[0]-i <= 6:
+            return abs(after[1]-page) <= 1
+        bounds = [a[1] for a in (before, after) if a]
+        return min(bounds)-1 <= page <= max(bounds)+1
+
+    candidates = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if i in protected or not stripped or stripped.startswith(("[[", "!", "|", "<", "---")):
+            continue
+        is_heading = bool(re.match(r"^#{1,6} ", line))
+        # Plain text may be a lost chapter title; never mine long prose paragraphs.
+        if not is_heading and (len(stripped) > 180 or not (
+                i == 0 or not lines[i-1].strip() or lines[i-1].startswith('<!-- pdf2md:page='))):
+            continue
+        spans, joined = [i], re.sub(r"^#{1,6} ", "", line).strip()
+        candidates.append((i, tuple(spans), joined, is_heading))
+        if not is_heading:
+            continue
+        # Join titles split into multiple headings, keeping intervening page links.
+        for k in range(i+1, min(i+12, len(lines))):
+            s = lines[k].strip()
+            if not s or re.match(r"^\[\[.*\.pdf#page=", s) or s.startswith('<!-- pdf2md:page='):
+                continue
+            if k in protected or not re.match(r"^#{1,6} ", lines[k]):
+                break
+            if re.match(r"^#{1,6} (?:\d|[A-Z]\.\d)", lines[k]):
+                break
+            spans.append(k)
+            joined += " " + re.sub(r"^#{1,6} ", "", lines[k]).strip()
+            if len(joined) > 300 or len(spans) > 3:
+                break
+            candidates.append((i, tuple(spans), joined, True))
+
+    edits, matched, missing, ambiguous = {}, 0, [], []
+    structural = {}
+    cursor = -1
+    changes = []
+    for entry in outline:
+        number, key = heading_key(entry['title'])
+        options = []
+        for i, span, text, was_heading in candidates:
+            if i <= cursor or not local(i, entry['page']):
+                continue
+            n, candidate_key = heading_key(text)
+            if n and number and n != number:
+                continue
+            if n and not number and n.count('.') + 1 != entry['level']:
+                continue
+            if not was_heading and entry['level'] != 1:
+                continue
+            score = 1.0 if key == candidate_key else difflib.SequenceMatcher(None, key, candidate_key).ratio()
+            if score < .94 or (score < 1 and min(len(key),len(candidate_key)) < 16):
+                continue
+            options.append((score, i, span, text))
+        options.sort(key=lambda x: (-x[0], x[1]))
+        if not options:
+            missing.append(entry)
+            continue
+        best = options[0]
+        if len(options) > 1 and best[0]-options[1][0] < .025:
+            ambiguous.append(entry)
+            continue
+        _, i, span, text = best
+        # Preserve extracted words/spelling and finer numbers: bookmarks can have
+        # their own typos. Use canonical numbers only when extraction lost them.
+        existing_number, _ = heading_key(text)
+        title = text
+        if number and not existing_number:
+            title = number + ' ' + title
+        replacement = '#' * entry['level'] + ' ' + title
+        structural[i] = entry
+        old = [lines[k] for k in span]
+        if old != [replacement]:
+            edits[i] = replacement
+            for k in span[1:]:
+                edits[k] = None
+            changes.append({"line": i+1, "old": old, "new": replacement, "page": entry['page']})
+        cursor = max(span)
+        matched += 1
+    # OCR often promotes callouts, subtitles and even code comments to H1/H2.
+    # Within a positively identified chapter, these are subordinate to the most
+    # recent numbered/bookmarked section, not new peers of that section.
+    active, parent_depth, chapter_end = False, 1, None
+    for i, line in enumerate(lines):
+        if i in protected or edits.get(i, line) is None:
+            continue
+        if i in structural:
+            e = structural[i]
+            parent_depth = e['level']
+            if parent_depth == 1:
+                active = True
+                chapter_end = next((x['page'] for x in outline
+                                    if x['level'] == 1 and x['page'] > e['page']), None)
+            continue
+        h = re.match(r'^(#{1,6}) (.+)$', line)
+        if not h or not active:
+            continue
+        n, _ = heading_key(h[2])
+        if n:
+            parent_depth = min(6, n.count('.') + 1)
+            if parent_depth == 1:  # unmatched chapter: fall back rather than flatten it
+                active = False
+            continue
+        if re.fullmatch(r'notes|problems|exercises|further reading|references|bibliography|summary', h[2], re.I):
+            # Common unbookmarked end-of-chapter sections are chapter-level
+            # siblings, not children of the preceding Summary or last section.
+            parent_depth = 2
+            continue
+        before = previous[i]
+        if chapter_end is not None and before and before[1] >= chapter_end:
+            active = False
+            continue
+        depth = len(h[1])
+        if depth <= parent_depth:
+            replacement = '#' * min(6, parent_depth+1) + ' ' + h[2]
+            if replacement != line:
+                edits[i] = replacement
+                changes.append({'line': i+1, 'old': [line], 'new': replacement,
+                                'page': before[1] if before else None,
+                                'reason': 'subordinate OCR heading inside a confirmed chapter'})
+    return '\n'.join(edits.get(i, line) for i, line in enumerate(lines) if edits.get(i, line) is not None), {
+        "matched": matched, "changes": changes, "unmatched": missing, "ambiguous": ambiguous}
+
+
 CHAPTER_H1 = re.compile(r"^# (\d{1,3})[ \t]+(\S.*?)[ \t]*$")
 BACK_HEADING = re.compile(r"^#{1,2} (bibliography|references|index|glossary)\s*$", re.I)
 UNSAFE_NAME = re.compile(r'[\\/:*?"<>|#^\[\]]')
@@ -1144,7 +1406,7 @@ def convert_slice(conv, pdf: Path, page_range: tuple[int, int], assets_dir: Path
                 if im is not None and min(im.size) >= MIN_FIGURE_PX:
                     fut = pool.submit(ask_figure, png_bytes(im))
             pictures.append(fut)
-        elif page_links and isinstance(item, SectionHeaderItem):
+        elif isinstance(item, SectionHeaderItem):
             headings.append((item, item.prov[0].page_no if item.prov else None, getattr(item, "level", None)))
         elif (pool and ask_inline and isinstance(item, TextItem)
               and item.label in (DocItemLabel.TEXT, DocItemLabel.LIST_ITEM, DocItemLabel.CAPTION)
@@ -1221,12 +1483,12 @@ def convert_slice(conv, pdf: Path, page_range: tuple[int, int], assets_dir: Path
                                               pdf.name, assets_dir)
                 item.text = marker
                 stats["eq_flagged"] += 1
-    head_marks: list[tuple[str, str]] = []
+    head_marks: list[tuple[str, int, str | None]] = []
     for n, (item, page, level) in enumerate(headings):    # a link to the PDF page under each real heading
-        link = link_target(pdf.name, page) if page else None
-        if link and wants_page_link(item.text or "", level):
+        link = link_target(pdf.name, page) if page and page_links and wants_page_link(item.text or "", level) else None
+        if page:
             marker = f"PDFMDHEAD{n}X"
-            head_marks.append((marker, link))
+            head_marks.append((marker, page, link))
             item.text = f"{marker} {item.text}"
     descriptions: dict[int, str] = {}
     for n, fut in enumerate(pictures):
@@ -1250,8 +1512,10 @@ def convert_slice(conv, pdf: Path, page_range: tuple[int, int], assets_dir: Path
             for f in art.iterdir():
                 shutil.copy2(f, assets_dir / f.name)
     md = apply_swaps(md, swaps)
-    for marker, link in head_marks:
-        md = re.sub(rf"^(#{{1,6}}) {marker} ?(.*)$", lambda m, link=link: f"{m.group(1)} {m.group(2)}\n\n{link}", md, flags=re.M)
+    for marker, page, link in head_marks:
+        md = re.sub(rf"^(#{{1,6}}) {marker} ?(.*)$",
+                    lambda m, page=page, link=link: f"<!-- pdf2md:page={page} -->\n\n{m.group(1)} {m.group(2)}" +
+                    (f"\n\n{link}" if link else ""), md, flags=re.M)
 
     def embed(m: re.Match) -> str:
         target = m.group(1)
@@ -1530,7 +1794,8 @@ def paddle_slice(pdf: Path, page_range: tuple[int, int], assets_dir: Path, serve
             texts = [f.read_text(encoding="utf-8") for f in sorted(d.glob("*.md"))]
             if texts:
                 link = link_target(pdf.name, page_no) if page_links else None
-                parts.append(clean_paddle_markdown("\n\n".join(texts), page_no, d, assets_dir, link))
+                parts.append(f"<!-- pdf2md:page={page_no} -->\n\n" +
+                             clean_paddle_markdown("\n\n".join(texts), page_no, d, assets_dir, link))
         parts += [f"<!-- page {n} could not be read -->" for n in bad]
         stats["eq_total"] = sum(len(re.findall(r"\$\$.+?\$\$", t, re.S)) for t in parts)
         return "\n\n".join(parts), stats
@@ -1719,6 +1984,15 @@ def convert_pdf(a: argparse.Namespace, pdf: Path) -> None:
             guard.__exit__()
 
     md = fix_headings(md)
+    try:
+        outline = read_pdf_outline(pdf)
+        md, heading_report = repair_pdf_headings(md, outline)
+        if outline:
+            print(f"      PDF outline: {heading_report['matched']}/{len(outline)} headings matched; "
+                  f"{len(heading_report['changes'])} repaired, {len(heading_report['ambiguous'])} ambiguous, "
+                  f"{len(heading_report['unmatched'])} unmatched (left unchanged)")
+    except (ImportError, OSError, ValueError, RuntimeError) as exc:
+        print(f"warning: PDF outline unavailable; using extracted headings ({type(exc).__name__})")
     if failed_pages:
         print(f"warning: {len(failed_pages)} page(s) could not be converted: {sorted(failed_pages)}")
     issues = validate_document(md)
