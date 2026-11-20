@@ -126,15 +126,17 @@ I ran the engines the Obsidian plugins in this space are built on, plus this too
 single-page PDFs: a seeded sample of [olmOCR-bench](https://huggingface.co/datasets/allenai/olmOCR-bench) covering
 all 8 of its categories (279 tests), scored with the benchmark's official scorer. Scores are % of tests passed.
 
-The table below records the **initial** configuration, before the resolution and table-text improvements.
-See the follow-up results below for the improved configuration; do not mix scores from different page sets.
+The improved configurations appear first, followed by the initial comparison runs. Every row uses the same
+46-page set. See the follow-up section for the separate, larger table/multi-column comparison.
 
 | Engine (used by) | arXiv math | Tables | Multi-column | Old scans | Overall | s/PDF |
 |---|---|---|---|---|---|---|
+| **This tool, improved Paddle — balanced, scale 2.5** | **94.7** | **76.0** | **81.0** | **45.2** | **80.2** | **7** |
+| **This tool, improved Paddle — tables priority, scale 4.0** | **91.2** | **88.0** | **76.2** | **41.9** | **77.6** | **8** |
 | Marker 2, balanced (OCR-AI) | 84.2 | 84.0 | 76.2 | 45.2 | **79.8** | 8 |
 | MinerU 4, standard tier (MinerU plugins) | 84.2 | 60.0 | 76.2 | 45.2 | **76.1** | 3 |
 | PaddleOCR-VL-1.6 pipeline, raw | 93.0 | 64.0 | 71.4 | 41.9 | **73.4** | 5 |
-| **This tool, PaddleOCR-VL engine** | 93.0 | 64.0 | 71.4 | 41.9 | **72.7** | 7 |
+| This tool, initial PaddleOCR-VL engine | 93.0 | 64.0 | 71.4 | 41.9 | **72.7** | 7 |
 | **This tool, Docling engine + gemma4:12b** | 84.2 | 80.0 | 61.9 | 25.8 | **68.9** | 20 |
 | Marker 2, fast | 64.9 | 52.0 | 71.4 | 22.6 | **60.7** | 1 |
 | Docling, default (MinerU Parser) | 0.0 | 80.0 | 66.7 | 12.9 | **53.2** | 1 |
@@ -145,6 +147,10 @@ See the follow-up results below for the improved configuration; do not mix score
 The overall column is the average over all 8 categories (the other four are in `tool/bench`). Times are per PDF on
 one RTX 5060 Ti; engines that load once and loop (Marker, MinerU, raw Paddle) are faster per page than ones started
 per PDF (this tool, 20 s with Ollama). The overall scores carry about ±4 to ±6 points of uncertainty.
+
+**Pick scale 2.5 for balanced use, or scale 4.0 when tables take priority.** Scale 4.0 improves table accuracy but
+does not win overall. Its 88.0% above is on the original 25 table checks; the 89.1% later in this README combines
+55 table checks across two page sets and must not be substituted into this table.
 
 What this does and does not show:
 
