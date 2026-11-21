@@ -16,9 +16,11 @@ from test_pdf_to_md import BOOK  # noqa: E402
 class Env:
     """Patches the worker, the server guard and the readiness check; records what the CLI asked for."""
 
-    def __init__(self, d, pages=100, md="Intro text.\n\n$$\nE = mc^2\n$$\n", fail=()):
-        self.d, self.pages, self.md, self.fail = Path(d), pages, md, set(fail)
+    def __init__(self, d, pages=100, md="Intro text.\n\n$$\nE = mc^2\n$$\n", fail=(), stats=None):
+        """md may be a function of the page range; stats are extra statistics returned for every slice."""
+        self.d, self.pages, self.md, self.fail, self.stats = Path(d), pages, md, set(fail), stats or {}
         self.slices, self.guards, self.backups, self.out = [], [], [], io.StringIO()
+        self.assets_at_backup = []
 
     def fake_slice(self, pdf, rng, assets, server, page_links, on_page=None, scale=2.5):
         self.slices.append((pdf.name, rng, server, page_links, scale))
@@ -29,7 +31,11 @@ class Env:
         for i in range(1, rng[1] - rng[0] + 2):
             if on_page:
                 on_page(i, rng[1] - rng[0] + 1)
-        return self.md, m.new_stats()
+        return (self.md(rng) if callable(self.md) else self.md), {**m.new_stats(), **self.stats}
+
+    def fake_backup(self, command):
+        self.backups.append((command, list(self.d.glob("*.md"))))
+        self.assets_at_backup.append(bool(list(self.d.rglob("*_assets")) or list(self.d.rglob("assets"))))
 
     def run(self, argv):
         env = self
@@ -47,7 +53,7 @@ class Env:
         with mock.patch.object(m, "paddle_slice", self.fake_slice), mock.patch.object(m, "ServerGuard", Guard), \
              mock.patch.object(backend, "require_ready", lambda: None), \
              mock.patch.object(m, "page_count", lambda p: self.pages), \
-             mock.patch.object(m, "run_backup", lambda c: self.backups.append((c, list(self.d.glob("*.md"))))), \
+             mock.patch.object(m, "run_backup", self.fake_backup), \
              mock.patch.object(m, "CACHE_ROOT", self.d / "cache"), \
              contextlib.redirect_stdout(self.out):
             m.main(argv)

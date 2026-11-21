@@ -11,11 +11,14 @@ import {
 	TFile,
 	TFolder,
 	normalizePath,
+	requireApiVersion,
 } from "obsidian";
 import { ChildProcess, execFile, spawn } from "child_process";
+import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import {
+	ConvertResult,
 	DEFAULT_SETTINGS,
 	SetupCheck,
 	buildInfoArgs,
@@ -40,9 +43,19 @@ import {
 	toVaultPath,
 	toolEnv,
 	validPages,
+	baseName,
+	checkOutputFolder,
+	parseResult,
+	pickPdf,
+	retryOutput,
+	retryPages,
+	reviewItems,
+	updateCommand,
+	versionWarning,
 } from "./runner";
 
 const MAX_LOG_LINES = 3000;
+const KILL_AFTER_MS = 10_000;
 
 const isPdf = (f: TAbstractFile): f is TFile => f instanceof TFile && f.extension.toLowerCase() === "pdf";
 
@@ -50,8 +63,11 @@ interface Job {
 	proc: ChildProcess;
 	files: TFile[];
 	wrote: { path: string; split: boolean }[];
+	results: ConvertResult[];
 	errors: string[];
 	cancelled: boolean;
+	exited: boolean;
+	killTimer: number | null;
 }
 
 /** What the progress window shows. It outlives the process so the result stays readable after it ends. */
@@ -60,13 +76,28 @@ interface RunView {
 	files: TFile[];
 	state: ProgressState;
 	wrote: { path: string; split: boolean }[];
+	results: ConvertResult[];
+	/** The page range this job was started with (single PDF only); a retry must reuse it. */
+	pages?: string;
 	error?: string;
 	endedAt?: number;
+}
+
+/** Extra options for a run that is not a plain conversion (retrying failed pages). */
+interface RunOptions {
+	/** `-o` value to use instead of the output-folder setting. */
+	outAbs?: string;
+	/** Runs after the setup check, just before the tool starts (e.g. trash the previous output). */
+	beforeRun?: () => Promise<void>;
+	/** Skip the time estimate (it would describe the whole PDF, not the pages being retried). */
+	skipEstimate?: boolean;
 }
 
 export default class Pdf2MdPlugin extends Plugin {
 	settings: Settings = { ...DEFAULT_SETTINGS };
 	private job: Job | null = null;
+	/** True from the moment a conversion is requested until it is running or has been abandoned. */
+	private starting = false;
 	private log: string[] = [];
 	private statusEl: HTMLElement | null = null;
 	private view: RunView | null = null;
@@ -109,6 +140,16 @@ export default class Pdf2MdPlugin extends Plugin {
 			},
 		});
 		this.addCommand({
+			id: "retry-failed-pages",
+			name: "Retry failed pages",
+			checkCallback: (checking) => {
+				const note = this.retryableNote();
+				if (!note) return false;
+				if (!checking) void this.retryFromNote(note);
+				return true;
+			},
+		});
+		this.addCommand({
 			id: "cancel-conversion",
 			name: "Cancel the running PDF conversion",
 			callback: () => this.cancel(),
@@ -134,7 +175,7 @@ export default class Pdf2MdPlugin extends Plugin {
 				if (isPdf(file)) {
 					menu.addItem((item) =>
 						item
-							.setTitle("Convert to Markdown (pdf2md-local)")
+							.setTitle("Convert to Markdown")
 							.setIcon("file-text")
 							.onClick(() => this.convertOne(file)),
 					);
@@ -164,6 +205,7 @@ export default class Pdf2MdPlugin extends Plugin {
 				}
 			}),
 		);
+		this.registerEvent(this.app.workspace.on("quit", () => this.cancel(true)));
 
 		this.addSettingTab(new Pdf2MdSettingTab(this.app, this));
 	}
@@ -183,6 +225,17 @@ export default class Pdf2MdPlugin extends Plugin {
 	private basePath(): string | null {
 		const a = this.app.vault.adapter;
 		return a instanceof FileSystemAdapter ? a.getBasePath() : null;
+	}
+
+	/** Vault-relative path for an absolute one printed by the tool (it prints resolved paths, so try the real vault path too). */
+	toVaultRel(abs: string): string | null {
+		const base = this.basePath();
+		if (!base) return null;
+		try {
+			return toVaultPath(base, abs, fs.realpathSync(base));
+		} catch {
+			return toVaultPath(base, abs);
+		}
 	}
 
 	// ---- checks before running ---------------------------------------------------------------
@@ -208,16 +261,18 @@ export default class Pdf2MdPlugin extends Plugin {
 		const out = await this.runTool(["check", "--json", "--server", s.paddleServer]);
 		const check = out === null ? null : parseCheck(out);
 		if (!check) {
-			new SetupModal(this.app, s.pdf2mdPath, null, "Could not run the pdf2md command.").open();
+			new SetupModal(this.app, s.pdf2mdPath, null, "Could not run the pdf2md command.", null, this.manifest.version).open();
 			return null;
 		}
+		const warning = versionWarning(check.version, this.manifest.version);
+		if (warning) new Notice(`PDF to Markdown: ${warning}`, 12000);
 		const serverUp = check.checks.find((c) => c.id === "server")?.ok ?? false;
 		const problem = setupProblem(check, s.serveCommand.trim() !== "");
 		if (problem) {
-			new SetupModal(this.app, s.pdf2mdPath, check.checks, problem).open();
+			new SetupModal(this.app, s.pdf2mdPath, check.checks, problem, warning, this.manifest.version).open();
 			return null;
 		}
-		if (verbose) new SetupModal(this.app, s.pdf2mdPath, check.checks, null).open();
+		if (verbose || warning) new SetupModal(this.app, s.pdf2mdPath, check.checks, null, warning, this.manifest.version).open();
 		return { ready: true, serverUp };
 	}
 
@@ -245,11 +300,23 @@ export default class Pdf2MdPlugin extends Plugin {
 		new PageRangeModal(this.app, file.name, (pages) => void this.convertFiles([file], pages)).open();
 	}
 
-	async convertFiles(files: TFile[], pages?: string) {
-		if (this.job) {
+	/** Never throws: every failure is shown as a notice. The slot is claimed at once and released on every early exit. */
+	async convertFiles(files: TFile[], pages?: string, opts: RunOptions = {}) {
+		if (this.job || this.starting) {
 			new Notice("PDF to Markdown: a conversion is already running.");
 			return;
 		}
+		this.starting = true;
+		try {
+			await this.startJob(files, pages, opts);
+		} catch (e) {
+			new Notice(`PDF to Markdown: could not start the conversion: ${e instanceof Error ? e.message : String(e)}`, 12000);
+		} finally {
+			this.starting = false;
+		}
+	}
+
+	private async startJob(files: TFile[], pages: string | undefined, opts: RunOptions) {
 		const base = this.basePath();
 		if (!base) {
 			new Notice("PDF to Markdown only works with a local (desktop) vault.");
@@ -258,19 +325,22 @@ export default class Pdf2MdPlugin extends Plugin {
 		if (!files.length) return;
 		const ready = await this.checkSetup();
 		if (!ready) return;
-		if (!(await this.confirmEstimate(files, base, files.length === 1 ? pages : undefined, ready.serverUp))) return;
+		if (!opts.skipEstimate && !(await this.confirmEstimate(files, base, files.length === 1 ? pages : undefined, ready.serverUp))) return;
 
-		let outAbs: string | undefined;
-		const raw = this.settings.outputFolder.trim();
-		if (raw) {
-			const folder = normalizePath(raw);
-			if (folder.split("/").includes("..") || path.isAbsolute(raw)) {
-				new Notice("PDF to Markdown: the output folder must be a folder inside the vault.", 10000);
+		let outAbs = opts.outAbs;
+		if (outAbs === undefined) {
+			const checked = checkOutputFolder(this.settings.outputFolder, this.app.vault.configDir);
+			if (!checked.ok) {
+				new Notice(`PDF to Markdown: ${checked.reason}`, 10000);
 				return;
 			}
-			if (!this.app.vault.getFolderByPath(folder)) await this.app.vault.createFolder(folder);
-			outAbs = path.join(base, folder);
+			if (checked.folder) {
+				const folder = normalizePath(checked.folder);
+				if (!this.app.vault.getFolderByPath(folder)) await this.app.vault.createFolder(folder);
+				outAbs = path.join(base, folder);
+			}
 		}
+		if (opts.beforeRun) await opts.beforeRun();
 		const args = buildArgs(
 			files.map((f) => path.join(base, f.path)),
 			this.settings,
@@ -284,9 +354,10 @@ export default class Pdf2MdPlugin extends Plugin {
 			env: this.env(),
 			detached: process.platform !== "win32",
 		});
-		const job: Job = { proc, files, wrote: [], errors: [], cancelled: false };
+		const job: Job = { proc, files, wrote: [], results: [], errors: [], cancelled: false, exited: false, killTimer: null };
 		this.job = job;
-		this.view = { running: true, files, state: initialState(Date.now(), files.length), wrote: job.wrote };
+		this.view = { running: true, files, state: initialState(Date.now(), files.length), wrote: job.wrote, results: job.results,
+			pages: files.length === 1 ? retryPages(pages) : undefined };
 		this.updateStatus();
 		if (this.settings.progressWindow) this.showProgress();
 		else new Notice("PDF to Markdown: converting. Click the status bar to see progress.", 6000);
@@ -302,6 +373,8 @@ export default class Pdf2MdPlugin extends Plugin {
 		if (!line.trim()) return;
 		this.log.push(line);
 		if (this.log.length > MAX_LOG_LINES) this.log.splice(1, this.log.length - MAX_LOG_LINES);
+		const result = parseResult(line);
+		if (result) job.results.push(result);
 		const p = parseLine(line);
 		if (this.view) this.view.state = reduce(this.view.state, p, Date.now());
 		if (p.kind === "wrote") job.wrote.push({ path: p.path, split: p.split });
@@ -310,10 +383,15 @@ export default class Pdf2MdPlugin extends Plugin {
 	}
 
 	private async finish(job: Job, code: number | null, note?: string) {
+		job.exited = true;
+		if (job.killTimer !== null) {
+			window.clearTimeout(job.killTimer);
+			job.killTimer = null;
+		}
 		if (this.job !== job) return;
 		this.job = null;
 		const total = job.files.length;
-		const ok = code === 0 && job.wrote.length > 0 && !job.cancelled;
+		const ok = code === 0 && (job.wrote.length > 0 || job.results.length > 0) && !job.cancelled;
 		if (this.view) {
 			this.view.running = false;
 			this.view.endedAt = Date.now();
@@ -326,19 +404,102 @@ export default class Pdf2MdPlugin extends Plugin {
 		this.updateStatus();
 		this.modal?.refresh();
 		const watching = this.modal !== null;       // the window is open: it shows the result, so no popup or auto-open
+		const converted = job.results.length || job.wrote.length;
+		const review = reviewItems(job.results).length > 0 ? ' Some results need review: see "Show conversion progress".' : "";
 		if (ok) {
 			if (watching) return;
 			if (total === 1) {
-				new Notice(`PDF to Markdown: finished ${job.files[0].name}.`, 8000);
-				await this.openResult(job.wrote[0]);
+				new Notice(`PDF to Markdown: finished ${job.files[0].name}.${review}`, 8000);
+				if (job.results[0]) await this.openAbs(job.results[0].output);
+				else if (job.wrote[0]) await this.openAbs(noteToOpen(job.wrote[0]));
 			} else {
-				new Notice(`PDF to Markdown: converted ${job.wrote.length} of ${total} PDFs.`, 10000);
+				new Notice(`PDF to Markdown: converted ${converted} of ${total} PDFs.${review}`, 10000);
 			}
 			return;
 		}
 		if (job.cancelled || watching) return;
-		const partial = job.wrote.length ? `${job.wrote.length} of ${total} converted. ` : "";
+		const partial = converted ? `${converted} of ${total} converted. ` : "";
 		new Notice(`PDF to Markdown failed: ${partial}${this.view?.error}. See "Show the last PDF conversion log".`, 12000);
+	}
+
+	// ---- retrying failed pages ---------------------------------------------------------------
+
+	/** The active note, if it records failed pages and the PDF it came from. */
+	private retryableNote(): TFile | null {
+		const f = this.app.workspace.getActiveFile();
+		if (!f || f.extension !== "md") return null;
+		const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
+		const failed: unknown = fm?.pages_failed;
+		if (!Array.isArray(failed) || failed.length === 0 || typeof fm?.source_pdf !== "string" || !fm.source_pdf) return null;
+		return f;
+	}
+
+	private async retryFromNote(note: TFile) {
+		const base = this.basePath();
+		if (!base) return;
+		const fm = this.app.metadataCache.getFileCache(note)?.frontmatter;
+		const name = typeof fm?.source_pdf === "string" ? baseName(fm.source_pdf) : "";
+		if (!name) return;
+		const found = this.app.vault.getFiles().filter((f) => isPdf(f) && f.name === name);
+		if (!found.length) {
+			new Notice(`PDF to Markdown: ${name} is not in this vault.`);
+			return;
+		}
+		const { pick, choices } = pickPdf(note.path, found.map((f) => f.path));
+		const byPath = (p: string) => found.find((f) => f.path === p);
+		const split = note.name === "00 Index.md" && !!note.parent && !note.parent.isRoot();
+		const output = path.join(base, note.path);
+		const folder = split && note.parent ? path.join(base, note.parent.path) : null;
+		const pages = retryPages(fm?.pages);
+		const go = (pdf: TFile) => void this.retryFailed(pdf, output, folder, pages);
+		if (pick) {
+			const pdf = byPath(pick);
+			if (pdf) go(pdf);
+		} else {
+			new PdfPicker(this.app, (f) => go(f), choices.map(byPath).filter((f): f is TFile => !!f)).open();
+		}
+	}
+
+	/** Move the previous output to the trash (after confirming) and run the same conversion again at the same place. */
+	async retryFailed(pdf: TFile, outputAbs: string, folderAbs: string | null, pages?: string) {
+		if (this.job || this.starting) {
+			new Notice("PDF to Markdown: a conversion is already running.");
+			return;
+		}
+		const base = this.basePath();
+		if (!base) return;
+		const plan = retryOutput(outputAbs, folderAbs);
+		const rel = this.toVaultRel(plan.trash);
+		const target = rel ? this.app.vault.getAbstractFileByPath(rel) : null;
+		if (!target) {
+			new Notice(`PDF to Markdown: could not find ${plan.trash} in the vault to replace.`, 10000);
+			return;
+		}
+		const what = target instanceof TFolder ? `the folder "${target.path}"` : `the note "${target.path}"`;
+		const go = await new Promise<boolean>((resolve) => new TrashConfirmModal(this.app, what, resolve).open());
+		if (!go) return;
+		await this.convertFiles([pdf], pages, {
+			outAbs: plan.out,
+			skipEstimate: true,
+			beforeRun: () => this.trash(target),
+		});
+	}
+
+	/** Move to the trash the way the user configured it (the file manager API needs Obsidian 1.6.6; older versions use the system trash). */
+	private async trash(target: TAbstractFile) {
+		if (requireApiVersion("1.6.6")) await this.app.fileManager.trashFile(target);
+		else await this.app.vault.trash(target, true);
+	}
+
+	/** Retry from a result in the report window: finds the PDF in the vault, then retries. */
+	retryResult(r: ConvertResult, pages?: string) {
+		const rel = this.toVaultRel(r.pdf);
+		const pdf = rel ? this.app.vault.getAbstractFileByPath(rel) : null;
+		if (!(pdf instanceof TFile)) {
+			new Notice(`PDF to Markdown: could not find ${baseName(r.pdf)} in the vault.`);
+			return;
+		}
+		void this.retryFailed(pdf, r.output, r.folder, pages);
 	}
 
 	// ---- progress window ---------------------------------------------------------------------
@@ -363,10 +524,6 @@ export default class Pdf2MdPlugin extends Plugin {
 		this.modal.open();
 	}
 
-	async openNote(w: { path: string; split: boolean }) {
-		await this.openResult(w);
-	}
-
 	/** Once a second while running: the status bar and the window recompute elapsed time and ETA. */
 	private tick() {
 		this.updateStatus();
@@ -383,20 +540,31 @@ export default class Pdf2MdPlugin extends Plugin {
 		}
 	}
 
-	private async openResult(w: { path: string; split: boolean }) {
-		const base = this.basePath();
-		if (!base) return;
-		const rel = toVaultPath(base, noteToOpen(w));
-		if (!rel) return;
-		for (let i = 0; i < 10; i++) {
-			// the file watcher needs a moment to notice files written by another process
-			const f = this.app.vault.getAbstractFileByPath(rel);
-			if (f instanceof TFile) {
-				await this.app.workspace.getLeaf(false).openFile(f);
-				return;
+	/** Open a note the tool wrote (absolute path). If it cannot be found in the vault, say where it was written. */
+	async openAbs(abs: string) {
+		const rel = this.toVaultRel(abs);
+		if (rel) {
+			for (let i = 0; i < 10; i++) {
+				// the file watcher needs a moment to notice files written by another process
+				const f = this.app.vault.getAbstractFileByPath(rel);
+				if (f instanceof TFile) {
+					await this.app.workspace.getLeaf(false).openFile(f);
+					return;
+				}
+				await new Promise((r) => window.setTimeout(r, 500));
 			}
-			await new Promise((r) => window.setTimeout(r, 500));
 		}
+		new Notice(`PDF to Markdown: written to ${abs}`, 12000);
+	}
+
+	/** Open a PDF at a page, in a new tab. */
+	async openPdfPage(pdfAbs: string, page: number) {
+		const rel = this.toVaultRel(pdfAbs);
+		if (!rel) {
+			new Notice(`PDF to Markdown: ${pdfAbs} is not inside the vault.`);
+			return;
+		}
+		await this.app.workspace.openLinkText(`${rel}#page=${page}`, "", true);
 	}
 
 	cancel(quiet = false) {
@@ -405,20 +573,51 @@ export default class Pdf2MdPlugin extends Plugin {
 			if (!quiet) new Notice("PDF to Markdown: nothing is running.");
 			return;
 		}
+		if (job.cancelled) return;
 		job.cancelled = true;
-		try {
-			if (process.platform !== "win32" && job.proc.pid) process.kill(-job.proc.pid, "SIGTERM");
-			else job.proc.kill();
-		} catch {
-			job.proc.kill();
+		this.killTree(job, "SIGTERM");
+		if (process.platform !== "win32") {
+			// the tool stops its own helpers on SIGTERM; if it has not exited after 10 s, kill the whole group
+			job.killTimer = window.setTimeout(() => {
+				job.killTimer = null;
+				if (!job.exited) this.killTree(job, "SIGKILL");
+			}, KILL_AFTER_MS);
 		}
 		if (!quiet) new Notice("PDF to Markdown: cancelling…");
+	}
+
+	private killTree(job: Job, signal: "SIGTERM" | "SIGKILL") {
+		const pid = job.proc.pid;
+		if (!pid) {
+			job.proc.kill(signal);
+			return;
+		}
+		if (process.platform === "win32") {
+			execFile("taskkill", ["/pid", String(pid), "/T", "/F"], () => undefined);
+			return;
+		}
+		try {
+			process.kill(-pid, signal);
+		} catch {
+			try {
+				job.proc.kill(signal);
+			} catch {
+				// already gone
+			}
+		}
 	}
 }
 
 /** The result of `pdf2md check`: what is ready, and for anything missing the command to run, with a copy button. */
 class SetupModal extends Modal {
-	constructor(app: App, private tool: string, private checks: SetupCheck[] | null, private problem: string | null) {
+	constructor(
+		app: App,
+		private tool: string,
+		private checks: SetupCheck[] | null,
+		private problem: string | null,
+		private warning: string | null,
+		private pluginVersion: string,
+	) {
 		super(app);
 	}
 
@@ -427,6 +626,11 @@ class SetupModal extends Modal {
 		const el = this.contentEl;
 		if (this.problem) el.createEl("p", { cls: "pdf2md-problem", text: this.problem });
 		else el.createEl("p", { text: "Everything required is ready." });
+		if (this.warning) {
+			el.createEl("p", { cls: "pdf2md-warning", text: this.warning });
+			el.createEl("p", { text: "You can still convert. To update the tool, run this in a terminal:" });
+			this.command(updateCommand(this.pluginVersion));
+		}
 		if (this.checks === null) {
 			el.createEl("p", { text: `Install the tool once in a terminal (then press Check again). The command "${this.tool}" must be on your path, or set its full path in the plugin settings.` });
 			this.command("uv tool install git+https://github.com/jyothisable/pdf2md-local");
@@ -486,6 +690,37 @@ class ConfirmModal extends Modal {
 	}
 }
 
+/** Confirm replacing earlier output when retrying failed pages. */
+class TrashConfirmModal extends Modal {
+	private answered = false;
+
+	constructor(app: App, private what: string, private done: (go: boolean) => void) {
+		super(app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("Retry failed pages?");
+		this.contentEl.createEl("p", {
+			text: `${this.what[0].toUpperCase()}${this.what.slice(1)} will be moved to the trash and written again. ` +
+				"If the checkpoint was kept, only the pages that failed are read again; the rest is reused.",
+		});
+		new Setting(this.contentEl)
+			.addButton((b) => b.setButtonText("Move to trash and retry").setCta().onClick(() => this.answer(true)))
+			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.answer(false)));
+	}
+
+	private answer(go: boolean) {
+		this.answered = true;
+		this.close();
+		this.done(go);
+	}
+
+	onClose() {
+		this.contentEl.empty();
+		if (!this.answered) this.done(false);
+	}
+}
+
 /** Turn a stream of chunks into whole lines. Progress lines may be split across chunks. */
 function lineSplitter(onLine: (line: string) => void): (chunk: string) => void {
 	let rest = "";
@@ -510,12 +745,12 @@ function collectPdfs(folder: TFolder): TFile[] {
 }
 
 class PdfPicker extends FuzzySuggestModal<TFile> {
-	constructor(app: App, private onPick: (f: TFile) => void) {
+	constructor(app: App, private onPick: (f: TFile) => void, private items?: TFile[]) {
 		super(app);
-		this.setPlaceholder("Choose a PDF to convert to Markdown");
+		this.setPlaceholder(items ? "Several PDFs have this name: choose one" : "Choose a PDF to convert to Markdown");
 	}
 	getItems(): TFile[] {
-		return this.app.vault.getFiles().filter(isPdf);
+		return this.items ?? this.app.vault.getFiles().filter(isPdf);
 	}
 	getItemText(f: TFile): string {
 		return f.path;
@@ -641,11 +876,23 @@ class PageRangeModal extends Modal {
 	}
 }
 
-/** Progress bar, stage, elapsed time and ETA. Closing it leaves the conversion running; the status bar brings it back. */
+
+/** Progress bar, stage, elapsed time and ETA, then the result and a review report. Closing it leaves the conversion running; the status bar brings it back. */
 class ProgressModal extends Modal {
-	private bodyEl!: HTMLElement;
 	private detailsOpen = false;
-	private logScroll: number | null = null;
+	private built = false;
+	private phase: "running" | "ended" | null = null;
+	private titleSet = "";
+	private barInner!: HTMLElement;
+	private bigEl!: HTMLElement;
+	private batchEl!: HTMLElement;
+	private pagesEl!: HTMLElement;
+	private stageEl!: HTMLElement;
+	private timeEl!: HTMLElement;
+	private logEl!: HTMLElement;
+	private logText = "";
+	private resultEl!: HTMLElement;
+	private buttonsEl!: HTMLElement;
 
 	constructor(app: App, private plugin: Pdf2MdPlugin, private onGone: () => void) {
 		super(app);
@@ -653,73 +900,169 @@ class ProgressModal extends Modal {
 
 	onOpen() {
 		this.modalEl.addClass("pdf2md-progress");
-		this.bodyEl = this.contentEl.createDiv();
 		this.refresh();
 	}
 
 	onClose() {
 		this.contentEl.empty();
+		this.built = false;
+		this.phase = null;
 		this.onGone();
 	}
 
-	/** Redraw from the current state. Cheap: called once a second and on every line of output. */
-	refresh() {
-		const v = this.plugin.runView();
-		if (!v || !this.bodyEl) return;
-		const now = v.endedAt ?? Date.now();
-		const s = v.state;
-		const el = this.bodyEl;
-		const oldLog = el.querySelector("pre.pdf2md-log");
-		if (oldLog) this.logScroll = oldLog.scrollTop;   // the view is rebuilt every second: keep what the user was reading
-		el.empty();
-
-		const single = v.files.length === 1;
-		this.titleEl.setText(single ? `Converting ${v.files[0].name}` : `Converting ${v.files.length} PDFs`);
-		const failed = !!v.error;
-		const done = !v.running && !failed;
-
-		if (!single) {
-			el.createDiv({ cls: "pdf2md-line", text: `PDF ${Math.min(s.pdfIndex, s.pdfTotal)} of ${s.pdfTotal}${s.pdfName ? ` · ${s.pdfName}` : ""}` });
-		}
-		const pct = done ? 100 : Math.round(fractionOverall(s) * 100);
+	/** The parts that never change while a job runs are built once. */
+	private build() {
+		const el = this.contentEl;
+		this.batchEl = el.createDiv({ cls: "pdf2md-line" });
 		const bar = el.createDiv({ cls: "pdf2md-bar-outer" });
-		const inner = bar.createDiv({ cls: "pdf2md-bar-inner" });
-		if (v.running && s.pagesTotal === 0) inner.addClass("is-indeterminate");
-		else inner.setCssProps({ "--pdf2md-pct": `${pct}%` });
-		if (failed) inner.addClass("is-failed");
-
-		const pages = s.pagesTotal > 0 ? `Page ${Math.min(s.pagesDone, s.pagesTotal)} of ${s.pagesTotal}` : "Preparing…";
-		el.createDiv({ cls: "pdf2md-big", text: failed ? "Stopped" : done ? "Finished" : `${pct}%` });
-		if (v.running) el.createDiv({ cls: "pdf2md-line", text: `${pages}${single ? "" : " in this PDF"}` });
-		el.createDiv({ cls: "pdf2md-line pdf2md-muted", text: v.running ? s.stage : failed ? v.error : `${s.wrote} note${s.wrote === 1 ? "" : "s"} written` });
-		const elapsed = formatDuration(Math.max(0, (now - s.startedAt) / 1000));
-		el.createDiv({
-			cls: "pdf2md-line",
-			text: v.running ? `Elapsed ${elapsed} · ${etaLabel(s, now)}` : `Took ${elapsed}`,
-		});
-
+		this.barInner = bar.createDiv({ cls: "pdf2md-bar-inner" });
+		this.bigEl = el.createDiv({ cls: "pdf2md-big" });
+		this.pagesEl = el.createDiv({ cls: "pdf2md-line" });
+		this.stageEl = el.createDiv({ cls: "pdf2md-line pdf2md-muted" });
+		this.timeEl = el.createDiv({ cls: "pdf2md-line" });
 		const details = el.createEl("details", { cls: "pdf2md-details" });
 		details.open = this.detailsOpen;
 		details.addEventListener("toggle", () => { this.detailsOpen = details.open; });
 		details.createEl("summary", { text: "Details" });
-		const log = details.createEl("pre", { cls: "pdf2md-log", text: this.plugin.logTail(14) });
-		if (this.detailsOpen) log.scrollTop = this.logScroll ?? log.scrollHeight;
+		this.logEl = details.createEl("pre", { cls: "pdf2md-log" });
+		this.resultEl = el.createDiv({ cls: "pdf2md-result" });
+		this.buttonsEl = el.createDiv({ cls: "pdf2md-buttons" });
+		this.built = true;
+	}
 
-		const buttons = el.createDiv({ cls: "pdf2md-buttons" });
+	/** Called every second and on every line of output: only text and the bar width change. */
+	refresh() {
+		const v = this.plugin.runView();
+		if (!v) return;
+		if (!this.built) this.build();
+		const now = v.endedAt ?? Date.now();
+		const s = v.state;
+		const single = v.files.length === 1;
+		const failed = !!v.error;
+		const done = !v.running && !failed;
+
+		const title = single ? `Converting ${v.files[0].name}` : `Converting ${v.files.length} PDFs`;
+		if (title !== this.titleSet) {
+			this.titleEl.setText(title);
+			this.titleSet = title;
+		}
+		this.batchEl.toggleClass("pdf2md-hidden", single);
+		if (!single) this.batchEl.setText(`PDF ${Math.min(s.pdfIndex, s.pdfTotal)} of ${s.pdfTotal}${s.pdfName ? ` · ${s.pdfName}` : ""}`);
+
+		const pct = done ? 100 : Math.round(fractionOverall(s) * 100);
+		const indeterminate = v.running && s.pagesTotal === 0;
+		this.barInner.toggleClass("is-indeterminate", indeterminate);
+		this.barInner.toggleClass("is-failed", failed);
+		if (!indeterminate) this.barInner.style.setProperty("--pdf2md-progress", `${pct}%`);
+
+		const pages = s.pagesTotal > 0 ? `Page ${Math.min(s.pagesDone, s.pagesTotal)} of ${s.pagesTotal}` : "Preparing…";
+		this.bigEl.setText(failed ? "Stopped" : done ? "Finished" : `${pct}%`);
+		this.pagesEl.toggleClass("pdf2md-hidden", !v.running);
+		this.pagesEl.setText(`${pages}${single ? "" : " in this PDF"}`);
+		this.stageEl.setText(v.running ? s.stage : failed ? (v.error ?? "") : `${s.wrote} note${s.wrote === 1 ? "" : "s"} written`);
+		const elapsed = formatDuration(Math.max(0, (now - s.startedAt) / 1000));
+		this.timeEl.setText(v.running ? `Elapsed ${elapsed} · ${etaLabel(s, now)}` : `Took ${elapsed}`);
+
+		const tail = this.plugin.logTail(14);
+		if (tail !== this.logText) {
+			const atEnd = this.logEl.scrollTop + this.logEl.clientHeight >= this.logEl.scrollHeight - 4;
+			const keep = this.logEl.scrollTop;
+			this.logEl.setText(tail);
+			this.logEl.scrollTop = atEnd ? this.logEl.scrollHeight : keep;
+			this.logText = tail;
+		}
+
+		const phase = v.running ? "running" : "ended";
+		if (phase !== this.phase) {
+			this.phase = phase;
+			this.renderEnd(v, done, single);
+		}
+	}
+
+	/** Buttons and the result report: rebuilt only when the job starts or ends. */
+	private renderEnd(v: NonNullable<ReturnType<Pdf2MdPlugin["runView"]>>, done: boolean, single: boolean) {
+		this.buttonsEl.empty();
+		this.resultEl.empty();
 		if (v.running) {
-			const bg = buttons.createEl("button", { text: "Run in background", cls: "mod-cta" });
+			const bg = this.buttonsEl.createEl("button", { text: "Run in background", cls: "mod-cta" });
 			bg.addEventListener("click", () => this.close());
-			const cancel = buttons.createEl("button", { text: "Cancel conversion", cls: "mod-warning" });
+			const cancel = this.buttonsEl.createEl("button", { text: "Cancel conversion", cls: "mod-warning" });
 			cancel.addEventListener("click", () => this.plugin.cancel());
-		} else {
-			if (done && single && v.wrote[0]) {
-				const open = buttons.createEl("button", { text: "Open note", cls: "mod-cta" });
-				open.addEventListener("click", () => {
+			return;
+		}
+		this.renderResults(v);
+		const close = this.buttonsEl.createEl("button", { text: "Close", cls: done ? "mod-cta" : "" });
+		close.addEventListener("click", () => this.close());
+		if (done && single && v.results.length === 0 && v.wrote[0]) {
+			const w = v.wrote[0];
+			const open = this.buttonsEl.createEl("button", { text: "Open note", cls: "mod-cta" });
+			open.addEventListener("click", () => {
+				this.close();
+				void this.plugin.openAbs(noteToOpen(w));
+			});
+		}
+	}
+
+	private link(parent: HTMLElement, text: string, onClick: () => void) {
+		const a = parent.createEl("a", { text, href: "#", cls: "pdf2md-link" });
+		a.addEventListener("click", (e) => {
+			e.preventDefault();
+			onClick();
+		});
+	}
+
+	private renderResults(v: NonNullable<ReturnType<Pdf2MdPlugin["runView"]>>) {
+		const el = this.resultEl;
+		const plugin = this.plugin;
+		const inVault = (abs: string) => plugin.toVaultRel(abs);
+		const done = new Set(v.results.map((r) => inVault(r.pdf)));
+
+		// every written main note, clickable; with an old tool (no RESULT lines) fall back to the "wrote" lines
+		const notes = v.results.length
+			? v.results.map((r) => ({ abs: r.output, label: baseName(r.folder ?? r.output).replace(/\.md$/i, "") }))
+			: v.wrote.map((w) => ({ abs: noteToOpen(w), label: baseName(w.path).replace(/\.md$/i, "") }));
+		if (notes.length) {
+			el.createEl("h4", { text: notes.length === 1 ? "Written note" : `Written notes (${notes.length})` });
+			const ul = el.createEl("ul", { cls: "pdf2md-report-list" });
+			for (const n of notes) this.link(ul.createEl("li"), n.label, () => void plugin.openAbs(n.abs));
+		}
+		const missing = v.results.length ? v.files.filter((f) => !done.has(f.path)) : [];
+		if (missing.length) {
+			el.createEl("h4", { text: v.error && v.error.startsWith("Cancelled") ? "Not converted" : "Failed" });
+			const ul = el.createEl("ul", { cls: "pdf2md-report-list" });
+			for (const f of missing) ul.createEl("li", { text: f.path });
+		}
+
+		el.createEl("h4", { text: "Needs review" });
+		const items = reviewItems(v.results);
+		if (!items.length) {
+			el.createDiv({ cls: "pdf2md-muted", text: "Nothing needs review." });
+			return;
+		}
+		for (const r of items) {
+			const box = el.createDiv({ cls: "pdf2md-review" });
+			box.createDiv({ cls: "pdf2md-review-title", text: baseName(r.pdf) });
+			const ul = box.createEl("ul", { cls: "pdf2md-report-list" });
+			const pageLinks = (li: HTMLElement, note: string, page: number) => {
+				li.createSpan({ text: " · " });
+				this.link(li, "Open note", () => void plugin.openAbs(note));
+				li.createSpan({ text: " · " });
+				this.link(li, "Open PDF page", () => void plugin.openPdfPage(r.pdf, page));
+			};
+			for (const p of r.pagesFailed) pageLinks(ul.createEl("li", { text: `Page ${p} could not be read` }), r.output, p);
+			for (const f of r.formulaImages) pageLinks(ul.createEl("li", { text: `Page ${f.page}: a formula was kept as a picture` }), f.note, f.page);
+			for (const m of r.mathWarnings) {
+				const li = ul.createEl("li", { text: `${baseName(m.note)}: ${m.count} maths warning${m.count === 1 ? "" : "s"}` });
+				li.createSpan({ text: " · " });
+				this.link(li, "Open note", () => void plugin.openAbs(m.note));
+			}
+			if (r.pagesFailed.length) {
+				const retry = box.createEl("button", { text: "Retry failed pages" });
+				retry.addEventListener("click", () => {
 					this.close();
-					void this.plugin.openNote(v.wrote[0]);
+					plugin.retryResult(r, v.pages);
 				});
 			}
-			buttons.createEl("button", { text: "Close", cls: done && !single ? "mod-cta" : "" }).addEventListener("click", () => this.close());
 		}
 	}
 }
@@ -761,14 +1104,16 @@ class Pdf2MdSettingTab extends PluginSettingTab {
 			.addText((t) => t.setValue(s.pdf2mdPath).onChange(async (v) => { s.pdf2mdPath = v.trim() || DEFAULT_SETTINGS.pdf2mdPath; await save(); }));
 
 		new Setting(containerEl).setName("Model server").setHeading();
-		new Setting(containerEl).setName("Page resolution")
-			.setDesc("Balanced: 180 dpi (recommended). High resolution: 288 dpi, for table-heavy PDFs.")
-			.addDropdown((d) => d.addOptions({ "2.5": "Balanced (180 dpi)", "4": "Tables (288 dpi)" })
-				.setValue(String(s.paddleScale)).onChange(async (v) => { s.paddleScale = Number(v); await save(); }));
 		new Setting(containerEl).setName("Server address").setDesc("Where llama-server listens. Default: http://127.0.0.1:8111/v1")
 			.addText((t) => t.setValue(s.paddleServer).onChange(async (v) => { s.paddleServer = v.trim() || DEFAULT_SETTINGS.paddleServer; await save(); }));
 		new Setting(containerEl).setName("Start command").setDesc("Run only if nothing answers at that address, and stopped when the conversion ends. Empty = pdf2md serve, which needs llama-server on your PATH.")
 			.addText((t) => t.setPlaceholder("pdf2md serve").setValue(s.serveCommand).onChange(async (v) => { s.serveCommand = v; await save(); }));
+
+		new Setting(containerEl).setName("Page reading").setHeading();
+		new Setting(containerEl).setName("Page resolution")
+			.setDesc("Balanced (180 dpi) is recommended. Tables (288 dpi) is slower but reads table-heavy PDFs better.")
+			.addDropdown((d) => d.addOptions({ "2.5": "Balanced (180 dpi)", "4": "Tables (288 dpi)" })
+				.setValue(String(s.paddleScale)).onChange(async (v) => { s.paddleScale = Number(v); await save(); }));
 
 		new Setting(containerEl).setName("Output").setHeading();
 		new Setting(containerEl).setName("Split books into chapters").setDesc("Writes a folder with an index, front matter, one note per chapter and back matter. Needs numbered chapter headings; otherwise one note is written.")
@@ -776,7 +1121,7 @@ class Pdf2MdSettingTab extends PluginSettingTab {
 		new Setting(containerEl).setName("Output folder").setDesc("Vault-relative folder. Empty = next to the PDF.")
 			.addText((t) => t.setPlaceholder("e.g. Imports").setValue(s.outputFolder).onChange(async (v) => { s.outputFolder = v; await save(); }));
 		new Setting(containerEl).setName("Links to PDF pages").setDesc("Adds [[file.pdf#page=N]] under each heading. Auto = on.")
-			.addDropdown((d) => d.addOptions({ auto: "auto", on: "always", off: "never" }).setValue(s.pageLinks).onChange(async (v) => { s.pageLinks = v as PageLinks; await save(); }));
+			.addDropdown((d) => d.addOptions({ auto: "Auto", on: "Always", off: "Never" }).setValue(s.pageLinks).onChange(async (v) => { s.pageLinks = v as PageLinks; await save(); }));
 		new Setting(containerEl).setName("Keep hidden page markers").setDesc("Keeps an invisible <!-- pdf2md:page=N --> comment at the start of every page. Off by default; the visible page links are not affected.")
 			.addToggle((t) => t.setValue(s.keepPageMarkers).onChange(async (v) => { s.keepPageMarkers = v; await save(); }));
 		new Setting(containerEl).setName("Show a progress window").setDesc("Opens when a conversion starts, with a progress bar and the time left. Close it to keep working: the conversion continues, and clicking the status bar reopens it.")

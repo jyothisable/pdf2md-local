@@ -5,6 +5,8 @@ import {
 	batchLabel, validPages, toolEnv, quoteArg, migrateSettings, parseCheck, setupProblem,
 	parseEstimate, buildInfoArgs, estimateText, needsConfirmation,
 	initialState, reduce, fractionOverall, etaSeconds, formatDuration, etaLabel, statusBarText,
+	updateCommand, versionWarning, checkOutputFolder, parseResult, needsReview, reviewItems, retryOutput, pickPdf,
+	dirName, baseName, retryPages,
 } from "../.test-build/runner.mjs";
 
 test("splitArgs honours quotes and empty input", () => {
@@ -243,4 +245,74 @@ test("buildInfoArgs passes the page range only for a single PDF", () => {
 	assert.deepEqual(buildInfoArgs(["/a.pdf"], " 10-40 "), ["info", "--json", "/a.pdf", "--pages", "10-40"]);
 	assert.deepEqual(buildInfoArgs(["/a.pdf", "/b.pdf"], "10-40"), ["info", "--json", "/a.pdf", "/b.pdf"]);
 	assert.deepEqual(buildInfoArgs(["/a.pdf"]), ["info", "--json", "/a.pdf"]);
+});
+
+test("toVaultPath also matches the real path of a symlinked vault", () => {
+	assert.equal(toVaultPath("/home/u/link", "/data/vault/Books/a.md", "/data/vault"), "Books/a.md");
+	assert.equal(toVaultPath("/home/u/link", "/home/u/link/Books/a.md", "/data/vault"), "Books/a.md");
+	assert.equal(toVaultPath("/home/u/link", "/data/vault2/a.md", "/data/vault"), null);
+	assert.equal(toVaultPath("/home/u/link", "/data/vault/a.md", null), null);
+});
+
+test("parseCheck keeps the version; versionWarning compares major.minor", () => {
+	assert.equal(parseCheck('{"ready":true,"checks":[],"version":"0.6.2"}').version, "0.6.2");
+	assert.ok(!("version" in parseCheck('{"ready":true,"checks":[]}')));
+	assert.equal(versionWarning("0.6.2", "0.6.0"), null);
+	assert.match(versionWarning(undefined, "0.6.0"), /does not report its version/);
+	assert.match(versionWarning("0.5.0", "0.6.0"), /0\.5\.0.*0\.6\.0/);
+	assert.match(versionWarning("1.6.0", "0.6.0"), /1\.6\.0/);
+	assert.equal(updateCommand("0.6.0"), "uv tool install --force --reinstall git+https://github.com/jyothisable/pdf2md-local@0.6.0");
+});
+
+test("checkOutputFolder", () => {
+	assert.deepEqual(checkOutputFolder("  ", ".obsidian"), { ok: true, folder: "" });
+	assert.deepEqual(checkOutputFolder("Imports/./Books/", ".obsidian"), { ok: true, folder: "Imports/Books" });
+	assert.deepEqual(checkOutputFolder("Imports\\Books", ".obsidian"), { ok: true, folder: "Imports/Books" });
+	for (const bad of ["../x", "a/../../x", "/abs", "\\\\server\\share", "C:\\Users", "C:foo", "d:/x", ".obsidian", ".obsidian/plugins/x", ".Obsidian/x"]) {
+		assert.equal(checkOutputFolder(bad, ".obsidian").ok, false, bad);
+	}
+	assert.equal(checkOutputFolder(".obsidianx/a", ".obsidian").ok, true);
+	assert.equal(checkOutputFolder(".config/a", ".config").ok, false);
+});
+
+test("parseResult reads RESULT lines and ignores malformed ones", () => {
+	const good = { pdf: "/v/a.pdf", output: "/v/a.md", folder: null, notes: ["/v/a.md"], pages_failed: [40, 12],
+		formula_images: [{ page: 7, note: "/v/a.md" }, { page: "x", note: "/v/a.md" }],
+		math_warnings: [{ note: "/v/a.md", count: 3 }, { note: "/v/b.md", count: 0 }], cache_kept: true };
+	const r = parseResult("RESULT " + JSON.stringify(good));
+	assert.deepEqual(r, { pdf: "/v/a.pdf", output: "/v/a.md", folder: null, notes: ["/v/a.md"], pagesFailed: [12, 40],
+		formulaImages: [{ page: 7, note: "/v/a.md" }], mathWarnings: [{ note: "/v/a.md", count: 3 }], cacheKept: true });
+	assert.equal(parseResult("RESULT {nope"), null);
+	assert.equal(parseResult("RESULT []"), null);
+	assert.equal(parseResult('RESULT {"output":"/x"}'), null);
+	assert.equal(parseResult("[4/4] wrote /v/a.md (3s)"), null);
+	const min = parseResult('  RESULT {"pdf":"/a.pdf","output":"/a.md"}  ');
+	assert.deepEqual(min.pagesFailed, []);
+	assert.equal(min.cacheKept, false);
+	assert.equal(needsReview(min), false);
+	assert.deepEqual(reviewItems([min, r]), [r]);
+	assert.deepEqual(reviewItems([min]), []);
+});
+
+test("retryOutput, dirName, baseName and pickPdf", () => {
+	assert.deepEqual(retryOutput("/v/B/a.md", null), { trash: "/v/B/a.md", out: "/v/B/a.md" });
+	assert.deepEqual(retryOutput("/v/B/Book/00 Index.md", "/v/B/Book"), { trash: "/v/B/Book", out: "/v/B" });
+	assert.equal(dirName("C:\\v\\Book"), "C:\\v");
+	assert.equal(dirName("/Book"), "/");
+	assert.equal(baseName("/v/B/a.md"), "a.md");
+	assert.deepEqual(pickPdf("Notes/a.md", []), { pick: null, choices: [] });
+	assert.deepEqual(pickPdf("Notes/a.md", ["x/a.pdf"]), { pick: "x/a.pdf", choices: [] });
+	assert.deepEqual(pickPdf("Notes/Book/a.md", ["x/a.pdf", "Notes/a.pdf"]), { pick: "Notes/a.pdf", choices: [] });
+	assert.deepEqual(pickPdf("Notes/a.md", ["x/a.pdf", "y/a.pdf"]), { pick: null, choices: ["x/a.pdf", "y/a.pdf"] });
+});
+
+test("retryPages feeds the original page range into the retry arguments", () => {
+	assert.equal(retryPages("10-40"), "10-40");
+	assert.equal(retryPages(" 10 - 40 "), "10-40");
+	assert.equal(retryPages(7), "7");
+	for (const none of [undefined, null, "", "  ", "9-3", "x", "1,2", []]) assert.equal(retryPages(none), undefined, String(none));
+	const a = buildArgs("/v/a.pdf", DEFAULT_SETTINGS, "/v/B/a.md", retryPages("10-40"));
+	assert.equal(a[a.indexOf("--pages") + 1], "10-40");
+	assert.equal(a[a.indexOf("-o") + 1], "/v/B/a.md");
+	assert.ok(!buildArgs("/v/a.pdf", DEFAULT_SETTINGS, "/v/B/a.md", retryPages(undefined)).includes("--pages"));
 });

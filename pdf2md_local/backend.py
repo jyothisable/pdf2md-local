@@ -19,6 +19,13 @@ WORKER_DEPS = ["paddlepaddle==3.2.1", "paddleocr[doc-parser]==3.7.0", "pypdfium2
 WORKER_PYTHON = "3.12"
 MODEL_REPO = "PaddlePaddle/PaddleOCR-VL-1.6-GGUF"
 MODEL_FILES = ("PaddleOCR-VL-1.6-GGUF.gguf", "PaddleOCR-VL-1.6-GGUF-mmproj.gguf")
+# Pinned Hugging Face revision (commit sha) and per-file (size in bytes, sha256), from the HF API (lfs.oid).
+MODEL_REVISION = "511b09642bb324401f15f97cc23bc67e8f0a291d"
+MODEL_PINS = {
+    "PaddleOCR-VL-1.6-GGUF.gguf": (935769056, "f3ae46ec885050acf4b3d31944431e1fd90d50664fb09126af4a3c050ba14ee8"),
+    "PaddleOCR-VL-1.6-GGUF-mmproj.gguf": (881770560, "204d757d7610d9b3faab10d506d69e5b244e32bf765e2bab2d0167e65e0a058a"),
+}
+LLAMA_CPP_TAG = "b12606"        # the tested llama.cpp build; override with env PDF2MD_LLAMA_TAG
 DEFAULT_SERVER = "http://127.0.0.1:8111/v1"
 
 
@@ -51,8 +58,14 @@ def worker_imports_ok() -> bool:
     return r.returncode == 0
 
 
+def _model_ok(f: str) -> bool:
+    """Size check only (no hashing of multi-GB files); the sha256 is verified right after a download."""
+    p = model_dir() / f
+    return p.is_file() and p.stat().st_size == MODEL_PINS[f][0]
+
+
 def models_present() -> bool:
-    return all((model_dir() / f).is_file() and (model_dir() / f).stat().st_size > 0 for f in MODEL_FILES)
+    return all(_model_ok(f) for f in MODEL_FILES)
 
 
 def llama_dir() -> Path:
@@ -165,6 +178,24 @@ def pick_llama_assets(names: list[str], system: str, machine: str, cuda: tuple[i
     return hit or None
 
 
+def _has_tar_filter() -> bool:
+    import tarfile
+    return hasattr(tarfile, "data_filter")
+
+
+def _tar_member_unsafe(m, dest: Path) -> bool:
+    """Manual check for Pythons without tarfile extraction filters."""
+    def escapes(p: Path) -> bool:
+        return not p.resolve().is_relative_to(dest)
+    if m.isdev() or escapes(dest / m.name):
+        return True
+    if m.issym():
+        return os.path.isabs(m.linkname) or escapes((dest / m.name).parent / m.linkname)
+    if m.islnk():
+        return os.path.isabs(m.linkname) or escapes(dest / m.linkname)
+    return False
+
+
 def _safe_extract(archive: Path, dest: Path) -> None:
     import tarfile
     import zipfile
@@ -175,45 +206,68 @@ def _safe_extract(archive: Path, dest: Path) -> None:
                 if not (dest / m).resolve().is_relative_to(dest):
                     sys.exit(f"error: unsafe path in {archive.name}")
             z.extractall(dest)
-    else:
-        with tarfile.open(archive) as t:
-            for m in t.getmembers():
-                if not (dest / m.name).resolve().is_relative_to(dest) or m.islnk() and not (dest / m.linkname).resolve().is_relative_to(dest):
-                    sys.exit(f"error: unsafe path in {archive.name}")
+        return
+    with tarfile.open(archive) as t:
+        if _has_tar_filter():
+            try:
+                t.extractall(dest, filter="data")
+            except tarfile.FilterError:
+                sys.exit(f"error: unsafe path in {archive.name}")
+        else:
+            if any(_tar_member_unsafe(m, dest) for m in t.getmembers()):
+                sys.exit(f"error: unsafe path in {archive.name}")
             t.extractall(dest)   # members were checked above: nothing escapes dest
 
 
-def install_llama(choice: str = "auto") -> None:
-    """Download a prebuilt llama.cpp (llama-server) release into the data folder. Run only by `pdf2md setup`."""
+def _verify_file(file: Path, size: int | None, sha256: str | None, what: str) -> None:
+    """Check size and sha256 (hashed in 1 MB chunks); on mismatch delete the file and exit."""
     import hashlib
+    bad = None
+    if size is not None and file.stat().st_size != size:
+        bad = f"size {file.stat().st_size} instead of {size}"
+    elif sha256:
+        h = hashlib.sha256()
+        with open(file, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != sha256.lower():
+            bad = "sha256 differs"
+    if bad:
+        file.unlink()
+        sys.exit(f"error: checksum mismatch for {what} ({bad}); the file was deleted. Run `pdf2md setup` again.")
+
+
+def install_llama(choice: str = "auto", allow_unverified: bool = False) -> None:
+    """Download the pinned prebuilt llama.cpp (llama-server) into the data folder. Run only by `pdf2md setup`."""
     import platform
-    api = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=8"
+    tag = os.environ.get("PDF2MD_LLAMA_TAG") or LLAMA_CPP_TAG
+    api = f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{tag}"
     try:
         with urllib.request.urlopen(urllib.request.Request(api, headers={"Accept": "application/vnd.github+json"}), timeout=60) as r:
-            releases = json.loads(r.read())
+            rel = json.loads(r.read())
     except (urllib.error.URLError, OSError, ValueError) as e:
-        sys.exit(f"error: could not list llama.cpp releases ({e}). Install llama.cpp yourself and put llama-server on PATH.")
+        sys.exit(f"error: could not get llama.cpp release {tag} ({e}). Install llama.cpp yourself and put llama-server on PATH.")
     vulkan = bool(shutil.which("vulkaninfo")) or any(Path(p).exists() for p in ("/usr/lib/libvulkan.so.1", "/usr/lib64/libvulkan.so.1", "/usr/lib/x86_64-linux-gnu/libvulkan.so.1"))
-    for rel in releases:
-        assets = {a["name"]: a for a in rel.get("assets", [])}
-        picked = pick_llama_assets(list(assets), platform.system(), platform.machine(), _driver_cuda(), choice, vulkan)
-        if picked:
-            break
-    else:
-        sys.exit("error: no prebuilt llama.cpp matches this system. Build it from source (docs/install.md) "
+    assets = {a["name"]: a for a in rel.get("assets", [])}
+    picked = pick_llama_assets(list(assets), platform.system(), platform.machine(), _driver_cuda(), choice, vulkan)
+    if not picked:
+        sys.exit(f"error: no prebuilt llama.cpp {tag} matches this system. Build it from source (docs/install.md) "
                  "and put llama-server on PATH.")
-    dest = llama_dir() / rel["tag_name"]
+    missing = [n for n in picked if not (assets[n].get("digest") or "").startswith("sha256:")]
+    if missing and not allow_unverified:
+        sys.exit(f"error: GitHub gives no sha256 digest for {', '.join(missing)}, so the download cannot be verified. "
+                 "Run `pdf2md setup --allow-unverified` to install it anyway.")
+    dest = llama_dir() / tag
     dest.mkdir(parents=True, exist_ok=True)
     total = sum(assets[n]["size"] for n in picked) // 1_000_000
-    print(f"installing llama.cpp {rel['tag_name']}: {', '.join(picked)} (about {total} MB) into {dest}", flush=True)
+    print(f"installing llama.cpp {tag}: {', '.join(picked)} (about {total} MB) into {dest}", flush=True)
     for name in picked:
         a = assets[name]
         file = dest / name
-        _download(a["browser_download_url"], file)
+        _download(a["browser_download_url"], file, a.get("size"))
         digest = (a.get("digest") or "").removeprefix("sha256:")
-        if digest and hashlib.sha256(file.read_bytes()).hexdigest() != digest:
-            file.unlink()
-            sys.exit(f"error: checksum mismatch for {name}; run `pdf2md setup` again.")
+        if digest:
+            _verify_file(file, None, digest, name)
         _safe_extract(file, dest)
         file.unlink()
     exe = _installed_llama()
@@ -228,22 +282,76 @@ def _run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
-def _download(url: str, dest: Path) -> None:
+def _validator(url: str) -> str | None:
+    """ETag (or Last-Modified) from a HEAD request, for If-Range; None when unavailable."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=60) as r:
+            return r.headers.get("ETag") or r.headers.get("Last-Modified")
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def _download(url: str, dest: Path, expected_size: int | None = None) -> None:
+    """Resumable download to dest (via dest.part). Never leaves a truncated file under the final name."""
+    import http.client
+    import re
     part = dest.with_name(dest.name + ".part")
     have = part.stat().st_size if part.exists() else 0
-    req = urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        if have and r.status != 206:
+    try:
+        if expected_size is not None and have > expected_size:
+            part.unlink()
             have = 0
-        with open(part, "ab" if have else "wb") as f:
-            shutil.copyfileobj(r, f, 1 << 20)
+        total = expected_size
+        if have and have == expected_size:
+            pass                                    # already complete
+        else:
+            headers = {}
+            if have:
+                validator = _validator(url)
+                if validator:
+                    headers = {"Range": f"bytes={have}-", "If-Range": validator}
+                else:
+                    have = 0                        # cannot resume safely
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as r:
+                    status = getattr(r, "status", 200)
+                    if have and status != 206:
+                        have = 0                    # server ignored the range: start again
+                    length = r.headers.get("Content-Length")
+                    cr = re.fullmatch(r"bytes\s+\d+-\d+/(\d+)", r.headers.get("Content-Range") or "")
+                    if total is None:
+                        if cr:
+                            total = int(cr[1])
+                        elif length is not None:
+                            total = have + int(length)
+                    with open(part, "ab" if have else "wb") as f:
+                        shutil.copyfileobj(r, f, 1 << 20)
+            except urllib.error.HTTPError as e:
+                if e.code != 416 or not have:
+                    raise
+                m = re.fullmatch(r"bytes\s+\*/(\d+)", e.headers.get("Content-Range") or "") if e.headers else None
+                if total is None and m:
+                    total = int(m[1])
+                if total is not None and have != total:
+                    part.unlink()
+                    sys.exit(f"error: partial download of {dest.name} does not match the server; "
+                             "it was deleted. Run `pdf2md setup` again.")
+        size = part.stat().st_size
+        if total is not None and size < total:
+            sys.exit(f"error: download of {dest.name} was cut off ({size} of {total} bytes). "
+                     "Run `pdf2md setup` again to resume.")
+        if total is not None and size > total:
+            part.unlink()
+            sys.exit(f"error: download of {dest.name} is larger than expected; it was deleted. Run `pdf2md setup` again.")
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+        sys.exit(f"error: could not download {dest.name}: {e}. Run `pdf2md setup` again to resume.")
     part.replace(dest)
 
 
-def setup(llama: str = "auto", llama_only: bool = False) -> None:
+def setup(llama: str = "auto", llama_only: bool = False, allow_unverified: bool = False) -> None:
     venv = venv_dir()
     if llama != "skip" and not llama_server():
-        install_llama(llama)
+        install_llama(llama, allow_unverified)
     if llama_only:
         return
     if not worker_imports_ok():
@@ -260,12 +368,12 @@ def setup(llama: str = "auto", llama_only: bool = False) -> None:
     md = model_dir()
     md.mkdir(parents=True, exist_ok=True)
     for f in MODEL_FILES:
-        if not (md / f).is_file():
-            print(f"downloading {f} from huggingface.co/{MODEL_REPO} (about 1 GB in total) ...", flush=True)
-            try:
-                _download(f"https://huggingface.co/{MODEL_REPO}/resolve/main/{f}", md / f)
-            except (urllib.error.URLError, OSError) as e:
-                sys.exit(f"error: could not download {f}: {e}. Run `pdf2md setup` again to resume.")
+        if not _model_ok(f):
+            size, sha = MODEL_PINS[f]
+            print(f"downloading {f} from huggingface.co/{MODEL_REPO}@{MODEL_REVISION[:8]} (about 1 GB in total) ...", flush=True)
+            _download(f"https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_REVISION}/{f}", md / f, size)
+            print(f"verifying {f} ...", flush=True)
+            _verify_file(md / f, size, sha, f)
     print("setup finished.")
     if not llama_server():
         print("note: no llama-server yet (skipped); install llama.cpp, or run `pdf2md setup` again to download one.")
@@ -386,7 +494,9 @@ def info(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="pdf2md " + argv[0])
+    ap = argparse.ArgumentParser(prog="pdf2md " + argv[0], epilog=(
+        f"llama.cpp is pinned to build {LLAMA_CPP_TAG}; set env PDF2MD_LLAMA_TAG to use another release tag.")
+        if argv[0] == "setup" else None)
     if argv[0] == "serve":
         ap.parse_args(argv[1:])
         return serve()
@@ -402,7 +512,8 @@ def main(argv: list[str]) -> int:
         checks = status(a.server)
         ready = all(c["ok"] for c in checks if c["required"])
         if a.json:
-            print(json.dumps({"ready": ready, "checks": checks}))
+            from pdf2md_local import __version__
+            print(json.dumps({"ready": ready, "version": __version__, "checks": checks}))
         else:
             for c in checks:
                 mark = "ok     " if c["ok"] else ("MISSING" if c["required"] else "not set")
@@ -412,6 +523,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--llama", choices=("auto", "cuda", "vulkan", "cpu", "skip"), default="auto",
                     help="which prebuilt llama.cpp to download if llama-server is not found (default: auto-detect; skip = never)")
     ap.add_argument("--llama-only", action="store_true", help="only install llama-server")
+    ap.add_argument("--allow-unverified", action="store_true",
+                    help="install llama.cpp even if GitHub provides no sha256 digest for the download")
     a = ap.parse_args(argv[1:])
-    setup(a.llama, a.llama_only)
+    setup(a.llama, a.llama_only, a.allow_unverified)
     return 0

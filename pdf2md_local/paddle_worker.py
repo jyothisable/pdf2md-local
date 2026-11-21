@@ -16,7 +16,18 @@ import sys
 import tempfile
 from pathlib import Path
 
-from pdf2md_local import convert as formatting
+# pdf2md_local lives in the CLI's environment, not in this venv: append (never prepend) its parent so the venv's own
+# numpy / pillow / paddle packages win.
+_parent = os.environ.get("PDF2MD_PACKAGE_PARENT")
+if _parent and _parent not in sys.path:
+    sys.path.append(_parent)
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+from pdf2md_local import convert as formatting  # noqa: E402
 
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 

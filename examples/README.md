@@ -6,11 +6,15 @@
 Try it after installing:
 
 ```bash
-pdf2md selftest                                   # converts it and checks the result
-# where the sample PDF is, to convert it yourself:
-python -c "import pdf2md_local, pathlib; print(pathlib.Path(pdf2md_local.__file__).with_name('data') / 'sample.pdf')"
+pdf2md selftest                                   # converts the bundled copy and checks the result
 ```
 
-`expected/` is what a conversion with `--split-chapters --flavor plain` produced on the reference machine. OCR output
-can differ slightly between machines and runs; if `pdf2md selftest` reports differences, compare with these files before
-filing an issue.
+To convert it yourself, download [`pdf2md_local/data/sample.pdf`](../pdf2md_local/data/sample.pdf) from this
+repository, then:
+
+```bash
+pdf2md sample.pdf --split-chapters --flavor plain -o out/ --serve-command "pdf2md serve"
+```
+
+`expected/` is what that conversion produced on the reference machine. OCR output can differ slightly between machines
+and runs; if `pdf2md selftest` reports differences, compare with these files before filing an issue.

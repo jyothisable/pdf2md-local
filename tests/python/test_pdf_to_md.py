@@ -187,12 +187,12 @@ class ResilienceTests(unittest.TestCase):
         failed = []
         md, st = m.convert_resilient(self.make({7}), (1, 10), failed)
         self.assertEqual(failed, [7])  # (retried once, still failing)
-        self.assertIn("page 7 could not be converted (RuntimeError)", md)
+        self.assertIn("<!-- pdf2md:failed page=7 -->", md)
         for p in (1, 6, 8, 10):
             self.assertIn(f"page {p}\n", md)
         self.assertEqual(st["eq_total"], 9)  # stats of the 9 good pages survive
-        self.assertLess(md.index("page 6"), md.index("could not be converted"))
-        self.assertLess(md.index("could not be converted"), md.index("page 8"))
+        self.assertLess(md.index("page 6"), md.index("pdf2md:failed"))
+        self.assertLess(md.index("pdf2md:failed"), md.index("page 8"))
 
     def test_transient_failure_is_retried_and_cleanup_runs(self):
         calls, cleaned = [], []
@@ -578,7 +578,7 @@ class PaddleSliceTests(unittest.TestCase):
                 md, st = m.paddle_slice(Path(d) / "My Book.pdf", (1, 4), Path(d) / "assets", "http://s/v1", True)
             self.assertLess(md.index("Text on page 1"), md.index("Text on page 2"))
             self.assertLess(md.index("Text on page 2"), md.index("Text on page 4"))
-            self.assertIn("<!-- page 3 could not be read -->", md)
+            self.assertIn("<!-- pdf2md:failed page=3 -->", md)
             self.assertNotIn("Text on page 3", md)
             self.assertIn("# Part B\n\n[[My Book.pdf#page=2|p. 2]]", md)
             self.assertEqual(sorted(p.name for p in (Path(d) / "assets").iterdir()), ["p0001_a.jpg", "p0002_a.jpg", "p0004_a.jpg"])

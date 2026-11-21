@@ -110,14 +110,35 @@ export interface SetupCheck {
 }
 
 /** Parse `pdf2md check --json`; null if the output is not what the tool prints. */
-export function parseCheck(text: string): { ready: boolean; checks: SetupCheck[] } | null {
+export function parseCheck(text: string): { ready: boolean; checks: SetupCheck[]; version?: string } | null {
 	try {
-		const d = JSON.parse(text) as { ready?: unknown; checks?: unknown } | null;
+		const d = JSON.parse(text) as { ready?: unknown; checks?: unknown; version?: unknown } | null;
 		if (typeof d?.ready !== "boolean" || !Array.isArray(d.checks)) return null;
-		return { ready: d.ready, checks: d.checks as SetupCheck[] };
+		const out: { ready: boolean; checks: SetupCheck[]; version?: string } = { ready: d.ready, checks: d.checks as SetupCheck[] };
+		if (typeof d.version === "string" && d.version.trim()) out.version = d.version.trim();
+		return out;
 	} catch {
 		return null;
 	}
+}
+
+/** The terminal command that installs exactly the tool version that matches this plugin version. */
+export function updateCommand(pluginVersion: string): string {
+	return `uv tool install --force --reinstall git+https://github.com/jyothisable/pdf2md-local@${pluginVersion}`;
+}
+
+const majorMinor = (v: string): string | null => {
+	const m = /^v?(\d+)\.(\d+)/.exec(v.trim());
+	return m ? `${m[1]}.${m[2]}` : null;
+};
+
+/** A warning when the tool's version is unknown or differs (major.minor) from the plugin's; null when they match. */
+export function versionWarning(cliVersion: string | null | undefined, pluginVersion: string): string | null {
+	if (!cliVersion) return `The installed pdf2md does not report its version, so it is older than this plugin (${pluginVersion}). Some features may not work until you update it.`;
+	const a = majorMinor(cliVersion);
+	const b = majorMinor(pluginVersion);
+	if (a === null || b === null || a === b) return null;
+	return `The installed pdf2md is version ${cliVersion} but this plugin is version ${pluginVersion}. Some features may not work until you update it.`;
 }
 
 export interface Estimate {
@@ -163,7 +184,7 @@ export function needsConfirmation(e: Estimate, thresholdMinutes: number): boolea
 }
 
 /** What to tell the user when the setup is incomplete, or null if a conversion can start. */
-export function setupProblem(c: { ready: boolean; checks: SetupCheck[] }, hasServeCommand: boolean): string | null {
+export function setupProblem(c: { ready: boolean; checks: SetupCheck[]; version?: string }, hasServeCommand: boolean): string | null {
 	const missing = c.checks.filter((x) => x.required && !x.ok);
 	if (missing.length) return `${missing[0].detail} is missing. In a terminal run: ${missing[0].fix}`;
 	const byId = (id: string) => c.checks.find((x) => x.id === id);
@@ -235,12 +256,17 @@ export function augmentedPath(env: Record<string, string | undefined>, home: str
 }
 
 /** Vault-relative, forward-slash path for an absolute one inside the vault, or null if it is outside. */
-export function toVaultPath(base: string, abs: string): string | null {
+export function toVaultPath(base: string, abs: string, realBase?: string | null): string | null {
 	const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "");
-	const b = norm(base);
 	const a = norm(abs);
-	if (a === b) return "";
-	return a.startsWith(b + "/") ? a.slice(b.length + 1) : null;
+	// The tool prints resolved paths, so a vault reached through a symlink must also match by its real location.
+	for (const candidate of [base, realBase]) {
+		if (!candidate) continue;
+		const b = norm(candidate);
+		if (a === b) return "";
+		if (a.startsWith(b + "/")) return a.slice(b.length + 1);
+	}
+	return null;
 }
 
 /** The note to open after a conversion: the index for a split book, the note itself otherwise. */
@@ -370,4 +396,128 @@ export function statusBarText(s: ProgressState, now: number): string {
 	const e = etaSeconds(s, now);
 	const batch = s.pdfTotal > 1 ? `PDF ${s.pdfIndex}/${s.pdfTotal} · ` : "";
 	return `PDF→MD: ${batch}${pct}%` + (e !== null && e >= 5 ? ` · ~${formatDuration(e)}` : "");
+}
+
+// ---- output folder ------------------------------------------------------------------------------------------
+
+/** Check the "output folder" setting. Returns the normalised vault-relative folder, or why it is not allowed. */
+export function checkOutputFolder(raw: string, configDir: string): { ok: true; folder: string } | { ok: false; reason: string } {
+	const t = raw.trim();
+	if (!t) return { ok: true, folder: "" };
+	if (/^[\\/]/.test(t) || /^[A-Za-z]:/.test(t)) return { ok: false, reason: "the output folder must be a folder inside the vault, not an absolute path." };
+	const parts = t.replace(/\\/g, "/").split("/").filter((x) => x !== "" && x !== ".");
+	if (parts.includes("..")) return { ok: false, reason: "the output folder must not contain \"..\"." };
+	const folder = parts.join("/");
+	const cfg = configDir.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").toLowerCase();
+	if (cfg && (folder.toLowerCase() === cfg || folder.toLowerCase().startsWith(cfg + "/"))) {
+		return { ok: false, reason: "the output folder must not be inside the Obsidian configuration folder." };
+	}
+	return { ok: true, folder };
+}
+
+// ---- RESULT lines, review report, retry ---------------------------------------------------------------------
+
+export interface ConvertResult {
+	pdf: string;
+	output: string;
+	folder: string | null;
+	notes: string[];
+	pagesFailed: number[];
+	formulaImages: { page: number; note: string }[];
+	mathWarnings: { note: string; count: number }[];
+	cacheKept: boolean;
+}
+
+const isInt = (x: unknown): x is number => typeof x === "number" && Number.isInteger(x);
+const isStr = (x: unknown): x is string => typeof x === "string" && x !== "";
+
+/** Parse a `RESULT <json>` line; null for anything else or malformed content. */
+export function parseResult(line: string): ConvertResult | null {
+	const l = line.trim();
+	if (!l.startsWith("RESULT ")) return null;
+	let d: Record<string, unknown>;
+	try {
+		const v: unknown = JSON.parse(l.slice(7));
+		if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+		d = v as Record<string, unknown>;
+	} catch {
+		return null;
+	}
+	if (!isStr(d.pdf) || !isStr(d.output)) return null;
+	const arr = (x: unknown): unknown[] => (Array.isArray(x) ? x : []);
+	const obj = (x: unknown): Record<string, unknown> | null => (x && typeof x === "object" && !Array.isArray(x) ? (x as Record<string, unknown>) : null);
+	const formulaImages: ConvertResult["formulaImages"] = [];
+	for (const e of arr(d.formula_images)) {
+		const o = obj(e);
+		if (o && isInt(o.page) && isStr(o.note)) formulaImages.push({ page: o.page, note: o.note });
+	}
+	const mathWarnings: ConvertResult["mathWarnings"] = [];
+	for (const e of arr(d.math_warnings)) {
+		const o = obj(e);
+		if (o && isStr(o.note) && isInt(o.count) && o.count > 0) mathWarnings.push({ note: o.note, count: o.count });
+	}
+	return {
+		pdf: d.pdf,
+		output: d.output,
+		folder: isStr(d.folder) ? d.folder : null,
+		notes: arr(d.notes).filter(isStr),
+		pagesFailed: arr(d.pages_failed).filter(isInt).sort((a, b) => a - b),
+		formulaImages,
+		mathWarnings,
+		cacheKept: d.cache_kept === true,
+	};
+}
+
+/** Does this result have anything the user should look at? */
+export function needsReview(r: ConvertResult): boolean {
+	return r.pagesFailed.length > 0 || r.formulaImages.length > 0 || r.mathWarnings.length > 0;
+}
+
+/** The results that need review, in order. Empty means "Nothing needs review". */
+export function reviewItems(results: ConvertResult[]): ConvertResult[] {
+	return results.filter(needsReview);
+}
+
+export function baseName(p: string): string {
+	const parts = p.replace(/\\/g, "/").replace(/\/+$/, "").split("/");
+	return parts[parts.length - 1] ?? p;
+}
+
+/** Parent folder of an absolute path, keeping the path's own separators. */
+export function dirName(p: string): string {
+	const t = p.replace(/[\\/]+$/, "");
+	const i = Math.max(t.lastIndexOf("/"), t.lastIndexOf("\\"));
+	if (i < 0) return ".";
+	return i === 0 ? t.slice(0, 1) : t.slice(0, i);
+}
+
+/**
+ * What to trash and which `-o` to use so a re-run lands in the same place: a single note is rewritten at its own
+ * path; a split book lives in a folder, whose parent folder is the `-o` value.
+ */
+export function retryOutput(output: string, folder: string | null): { trash: string; out: string } {
+	return folder ? { trash: folder, out: dirName(folder) } : { trash: output, out: output };
+}
+
+/** Choose the PDF for a note by name: the best match by shared folders, or the tied choices to ask about. */
+export function pickPdf(notePath: string, candidates: string[]): { pick: string | null; choices: string[] } {
+	if (candidates.length === 0) return { pick: null, choices: [] };
+	if (candidates.length === 1) return { pick: candidates[0], choices: [] };
+	const dirs = (p: string) => p.replace(/\\/g, "/").split("/").slice(0, -1);
+	const note = dirs(notePath);
+	const score = (c: string) => {
+		const d = dirs(c);
+		let n = 0;
+		while (n < d.length && n < note.length && d[n] === note[n]) n++;
+		return n;
+	};
+	const best = Math.max(...candidates.map(score));
+	const tied = candidates.filter((c) => score(c) === best);
+	return tied.length === 1 ? { pick: tied[0], choices: [] } : { pick: null, choices: tied };
+}
+
+/** The page range to reuse when retrying, from a note's `pages` frontmatter (or the job's own value): undefined = all pages. */
+export function retryPages(value: unknown): string | undefined {
+	const t = typeof value === "number" ? String(value) : typeof value === "string" ? value.trim() : "";
+	return t && validPages(t) ? t.replace(/\s+/g, "") : undefined;
 }

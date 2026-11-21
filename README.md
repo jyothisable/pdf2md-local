@@ -1,5 +1,9 @@
 # pdf2md-local
 
+[![CI](https://github.com/jyothisable/pdf2md-local/actions/workflows/ci.yml/badge.svg)](https://github.com/jyothisable/pdf2md-local/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/jyothisable/pdf2md-local)](https://github.com/jyothisable/pdf2md-local/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 ![pdf2md-local: a maths PDF converted to linked Markdown notes](docs/images/hero.gif)
 
 Convert maths and science PDFs to Markdown **on your own machine**: LaTeX equations, figures, tables, headings, and
@@ -22,18 +26,27 @@ setup used about **3 GB VRAM** on a **16 GB GPU**; an 8 GB card is expected to f
 
 ## Install
 
-You need [uv](https://docs.astral.sh/uv/), a GPU (NVIDIA recommended) and about 2 GB of disk for the model plus a few
-GB for Python packages and the llama.cpp download. Details, other platforms and troubleshooting:
+You need [uv](https://docs.astral.sh/uv/) and about **4 GB of disk**: 1.8 GB model, 1.4 GB worker environment
+(PaddleOCR), and up to 0.7 GB for llama.cpp (the CUDA build; Vulkan and CPU builds are under 50 MB).
+
+| Hardware | Speed (2.5 Balanced) | Memory |
+|---|---|---|
+| NVIDIA GPU (tested: 16 GB card) | about **3.4 s/page** | about 3 GB VRAM |
+| CPU only (tested: 12 cores) | about **22 s/page** (a 300-page book takes about 2 hours) | about 3 GB RAM for the server |
+
+Without an NVIDIA GPU, `pdf2md setup` uses Vulkan if available, else the CPU. Linux on ARM has no prebuilt
+llama.cpp: build it yourself. Details, other platforms, update, uninstall and troubleshooting:
 [docs/install.md](docs/install.md).
 
 ```bash
-uv tool install git+https://github.com/jyothisable/pdf2md-local   # the pdf2md command
+uv tool install git+https://github.com/jyothisable/pdf2md-local@0.6.0   # the pdf2md command (a fixed release)
 pdf2md setup       # once: worker environment, model, and a prebuilt llama.cpp (llama-server) if you have none
 pdf2md selftest    # converts a bundled 2-page sample and checks the result
 ```
 
-`pdf2md setup` is the only step that downloads anything. It picks the llama.cpp build for your system (CUDA, Vulkan,
-Metal or CPU) from the official releases and verifies its checksum; `--llama skip` leaves llama.cpp alone.
+`pdf2md setup` is the only step that downloads anything. The model is pinned to a fixed Hugging Face revision and
+checked against its SHA-256; llama.cpp is a tested release (`b12606`) for your system (CUDA, Vulkan, Metal or CPU),
+checked against the digest GitHub publishes. `--llama skip` leaves llama.cpp alone.
 `pdf2md check` shows what is ready at any time, and `pdf2md info book.pdf` estimates the time before you convert.
 
 ## Use
@@ -47,12 +60,17 @@ pdf2md --help
 
 Or let the tool start and stop the server for you: `pdf2md book.pdf --serve-command "pdf2md serve"`.
 
+If some pages could not be read, they are listed in the note's `pages_failed` frontmatter, the checkpoint is kept, and
+**running the same command again re-reads only those pages**. Pages whose formulas were kept as source pictures are
+reported too. Cancelling (Ctrl-C or SIGTERM) stops the page worker and any model server the run started.
+
 Outside an Obsidian vault the output is `plain` Markdown; inside a vault (a folder containing `.obsidian`) it is
 `obsidian` unless you pass `--flavor`. In a vault, a backup command of your choice can run first
 (`PDF2MD_BACKUP_COMMAND` or `--backup-command`); nothing is run by default.
 
-The `PROGRESS <done> <total>` lines on standard output are a stable, machine-readable progress feed.
-`pdf2md check --json` and `pdf2md info --json` print the readiness report and time estimate that the plugin uses.
+Machine-readable output: `PROGRESS <done> <total>` lines while converting, one `RESULT <json>` line per finished
+PDF (notes written, failed pages, formulas kept as pictures, math warnings), `pdf2md check --json` (readiness and
+version) and `pdf2md info --json` (time estimate). `pdf2md --version` prints the version.
 
 ## Obsidian plugin
 
@@ -66,18 +84,24 @@ Desktop only. After installing and checking the command-line tool as above:
    Before a long conversion the plugin shows the page count and estimated time and asks you to confirm.
 
 The progress window shows pages, stage and ETA; **Run in background** keeps the conversion running and the status bar
-reopens it.
+reopens it. When it finishes, it lists the notes written (one link per PDF in a batch) and a **needs review** report:
+pages that could not be read and formulas kept as pictures, with links to the note and to that PDF page, and math
+warnings per note. **Retry failed pages** (a button there, or a command on the converted note) moves the old output to
+Obsidian's trash and re-reads only the failed pages. **Check** also warns when the `pdf2md` tool's version does not
+match the plugin's.
 
 **What the plugin does and does not do**
 
 - It runs the `pdf2md` program you installed (and, only if nothing is listening, `pdf2md serve` or your own start
   command) as a local process, and stops it afterwards. It **never installs, downloads or updates anything itself**.
 - It reads the selected PDFs from your vault and writes new notes and images into your vault (or the output folder you set).
-- No telemetry, ads or accounts. The only network traffic is to the model server address you configure
-  (default `127.0.0.1`); `pdf2md setup` downloads packages and the model once, when you run it in a terminal.
+- No telemetry, ads or accounts. Converting only talks to the model server address you configure (default
+  `127.0.0.1`). `pdf2md setup`, which you run in a terminal, contacts PyPI (Python packages), Hugging Face (the model)
+  and GitHub (the llama.cpp release list and download).
 - **Files outside the vault:** the `pdf2md` tool keeps its worker environment in `~/.local/share/pdf2md-local`,
   model files in `~/.cache/pdf2md/models`, and temporary checkpoints in `~/.cache/pdf2md` (removed after a successful
-  run), and writes the model server log to your system temp folder. It reads and writes nothing else outside the vault.
+  run, kept while pages still need a retry). The llama.cpp download, the server log (`logs/llama-server.log`) and the
+  speed estimate (`rate.json`) are also in `~/.local/share/pdf2md-local`. It reads and writes nothing else outside the vault.
 - Settings are stored in the plugin's `data.json`; no secrets are involved.
 
 ## Current benchmark
@@ -124,7 +148,9 @@ This was not a full factual proofread; code extraction was not validated.
 - OCR and heading errors can remain even with zero structural warnings. Check important equations against the PDF.
 - Source-image fallbacks are **not editable LaTeX**. Merged-cell tables stay as HTML.
 - Old scans and complex layouts remain difficult.
-- Tested on Linux with a 16 GB GPU; 8 GB GPUs, macOS and Windows are untested.
+- Tested on Linux with a 16 GB GPU and on CPU; 8 GB GPUs, macOS and Windows are untested.
+- Flatpak and Snap builds of Obsidian are sandboxed and cannot run `pdf2md`; use the AppImage, `.deb`/`.rpm` or a
+  distribution package.
 
 ## Development
 
