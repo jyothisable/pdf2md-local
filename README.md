@@ -1,5 +1,7 @@
 # pdf2md-local
 
+![pdf2md-local: a maths PDF converted to linked Markdown notes](docs/images/hero.gif)
+
 Convert maths and science PDFs to Markdown **on your own machine**: LaTeX equations, figures, tables, headings, and
 whole books split into linked chapter notes. Use it as a **command-line tool** (plain Markdown, works anywhere) or as an
 **Obsidian plugin**. Documents are never uploaded.
