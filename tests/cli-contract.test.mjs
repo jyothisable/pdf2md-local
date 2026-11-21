@@ -17,7 +17,7 @@ test("flags emitted for the default settings exist in the tool", () => {
 
 test("flags emitted for every option combination exist in the tool", () => {
 	const variants = [
-		{ ...DEFAULT_SETTINGS, splitChapters: true },
+		{ ...DEFAULT_SETTINGS, splitChapters: true, keepPageMarkers: true },
 		{ ...DEFAULT_SETTINGS, pageLinks: "on", paddleScale: 4 },
 		{ ...DEFAULT_SETTINGS, serveCommand: "serve.sh", pageLinks: "off" },
 	];

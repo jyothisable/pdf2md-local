@@ -14,6 +14,7 @@ whole books split into linked chapter notes. Use it as a **command-line tool** (
 - Source-backed checks retry damaged equations or keep an exact source image instead of guessing.
 - Batch conversion, page ranges, checkpoint/resume and progress with ETA.
 - Two output flavours: `plain` (standard Markdown links and images) and `obsidian` (wikilinks and `![[embeds]]`).
+- Clean notes: the internal per-page comments are removed after heading repair (`--page-markers` keeps them).
 - Only new files are written; existing notes and source PDFs are never overwritten.
 
 **Model:** PaddleOCR-VL-1.6 served by llama.cpp, with the recommended **2.5 Balanced** page resolution. The tested

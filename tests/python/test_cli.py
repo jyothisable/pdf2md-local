@@ -76,6 +76,17 @@ class SingleNoteTests(unittest.TestCase):
             self.assertEqual(list((Path(d) / "cache").glob("*")), [])       # checkpoint removed after success
             self.assertEqual(env.guards[-1], "exit")
 
+    def test_hidden_page_markers_are_removed_unless_kept(self):
+        md = "<!-- pdf2md:page=1 -->\n\n# 1 One\n\ntext\n\n<!-- pdf2md:page=2 -->\n\nmore\n"
+        with tempfile.TemporaryDirectory() as d:
+            Env(d, md=md).run([make_pdf(d)])
+            text = (Path(d) / "paper.md").read_text()
+            self.assertNotIn("pdf2md:page", text)
+            self.assertIn("# 1 One\n\ntext\n\nmore", text)
+        with tempfile.TemporaryDirectory() as d:
+            Env(d, md=md).run([make_pdf(d), "--page-markers"])
+            self.assertEqual((Path(d) / "paper.md").read_text().count("pdf2md:page="), 2)
+
     def test_math_heading_and_entity_fixes_applied(self):
         with tempfile.TemporaryDirectory() as d:
             Env(d, md="# 3.4 Title &amp; more\n\nSome \\(x\\) text.\n").run([make_pdf(d)])
@@ -255,3 +266,19 @@ class BackendTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StripScriptTests(unittest.TestCase):
+    def test_script_removes_only_marker_lines_and_backs_up(self):
+        import subprocess
+        script = Path(__file__).resolve().parents[2] / "scripts" / "strip_page_markers.py"
+        with tempfile.TemporaryDirectory() as d:
+            note = Path(d) / "n.md"
+            original = "<!-- pdf2md:page=3 -->\n\n# Title\n\ntext <!-- pdf2md:page=9 --> inline stays\n\n<!-- pdf2md:page=4 -->\nmore\n"
+            note.write_text(original)
+            args = [sys.executable, "-I", str(script), str(note), "--backup-dir", str(Path(d) / "bk")]
+            subprocess.run(args, check=True, capture_output=True)
+            self.assertEqual(note.read_text(), original)                    # dry run changes nothing
+            subprocess.run(args + ["--apply"], check=True, capture_output=True)
+            self.assertEqual(note.read_text(), "# Title\n\ntext <!-- pdf2md:page=9 --> inline stays\n\nmore\n")
+            self.assertEqual((Path(d) / "bk" / "n.md").read_text(), original)

@@ -691,6 +691,8 @@ class Pdf2MdSettingTab extends PluginSettingTab {
 			.addText((t) => t.setPlaceholder("e.g. Imports").setValue(s.outputFolder).onChange(async (v) => { s.outputFolder = v; await save(); }));
 		new Setting(containerEl).setName("Links to PDF pages").setDesc("Adds [[file.pdf#page=N]] under each heading. Auto = on.")
 			.addDropdown((d) => d.addOptions({ auto: "auto", on: "always", off: "never" }).setValue(s.pageLinks).onChange(async (v) => { s.pageLinks = v as PageLinks; await save(); }));
+		new Setting(containerEl).setName("Keep hidden page markers").setDesc("Keeps an invisible <!-- pdf2md:page=N --> comment at the start of every page. Off by default; the visible page links are not affected.")
+			.addToggle((t) => t.setValue(s.keepPageMarkers).onChange(async (v) => { s.keepPageMarkers = v; await save(); }));
 		new Setting(containerEl).setName("Show a progress window").setDesc("Opens when a conversion starts, with a progress bar and the time left. Close it to keep working: the conversion continues, and clicking the status bar reopens it.")
 			.addToggle((t) => t.setValue(s.progressWindow).onChange(async (v) => { s.progressWindow = v; await save(); }));
 		new Setting(containerEl).setName("Ask which pages to convert").setDesc("Prompt for a page range before every single-PDF conversion. The command \"Convert PDF pages…\" always asks.")

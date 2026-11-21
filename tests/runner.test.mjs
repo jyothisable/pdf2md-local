@@ -43,6 +43,11 @@ test("buildArgs: toggles, output folder, scale, server, pages and extra args", (
 	assert.equal(bare[bare.indexOf("--serve-command") + 1], '"/opt/my tools/pdf2md" serve');   // a path with spaces stays one word
 });
 
+test("buildArgs: hidden page markers are off unless asked for", () => {
+	assert.ok(!buildArgs("/v/a.pdf", DEFAULT_SETTINGS).includes("--page-markers"));
+	assert.ok(buildArgs("/v/a.pdf", { ...DEFAULT_SETTINGS, keepPageMarkers: true }).includes("--page-markers"));
+});
+
 test("quoteArg", () => {
 	assert.equal(quoteArg("pdf2md"), "pdf2md");
 	assert.equal(quoteArg("/a b/c"), '"/a b/c"');

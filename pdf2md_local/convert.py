@@ -1500,6 +1500,14 @@ def run_backup(command: str) -> None:
     print(f"backup: {shown or 'done'}")
 
 
+PAGE_MARKER = re.compile(r"^<!-- pdf2md:page=\d+ -->[ \t]*\n(?:[ \t]*\n)*", re.M)
+
+
+def strip_page_markers(md: str) -> str:
+    """Remove the hidden per-page comments (and the blank lines after them); they are only needed for heading repair."""
+    return PAGE_MARKER.sub("", md)
+
+
 def to_plain(text: str, assets_rel: str, pdf_rel: str) -> str:
     """Obsidian syntax -> standard Markdown: ![[x.png]] -> ![](assets/x.png), [[a|b]] -> [b](a.md), PDF page links."""
     q = lambda v: urllib.parse.quote(v, safe="/#=")
@@ -1596,6 +1604,8 @@ def convert_pdf(a: argparse.Namespace, pdf: Path) -> None:
         print(f"warning: PDF outline unavailable; using extracted headings ({type(exc).__name__})")
     if failed_pages:
         print(f"warning: {len(failed_pages)} page(s) could not be converted: {sorted(failed_pages)}")
+    if not a.page_markers:
+        md = strip_page_markers(md)
     issues = validate_document(md)
     print(f"[3/4] math check: {len(issues)} problem(s)")
     for ln, why, snip in issues[:20]:
@@ -1687,6 +1697,8 @@ def main(argv: list[str] | None = None) -> None:
                          "instead of one big note; needs numbered chapter headings")
     ap.add_argument("--backup-command", default=os.environ.get("PDF2MD_BACKUP_COMMAND"),
                     help="command to run before writing into an Obsidian vault (default: $PDF2MD_BACKUP_COMMAND, none)")
+    ap.add_argument("--page-markers", action="store_true",
+                    help="keep the hidden <!-- pdf2md:page=N --> comment that starts every page (removed by default)")
     ap.add_argument("--no-backup", action="store_true", help="skip the backup command")
     ap.add_argument("--no-cache", action="store_true", help="no checkpointing (an interrupted run cannot resume)")
     ap.add_argument("--keep-cache", action="store_true", help="keep the checkpoint folder after success")

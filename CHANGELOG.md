@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.4
+
+- The hidden `<!-- pdf2md:page=N -->` comments are no longer written to notes. `--page-markers` (plugin: **Keep hidden page markers**) restores them.
+- `scripts/strip_page_markers.py` removes them from notes converted earlier (dry run by default; `--apply` backs up first).
+
 ## 0.4.3
 
 - Policy self-check with `eslint-plugin-obsidianmd`: type-safe parsing of the setup report, window timers, no inline styles, and no top-level settings heading.

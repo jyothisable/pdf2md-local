@@ -12,6 +12,8 @@ export interface Settings {
 	/** Command that starts the server if nothing answers; empty = `pdf2md serve`. The tool stops it again when done. */
 	serveCommand: string;
 	pageLinks: PageLinks;
+	/** Keep the hidden `<!-- pdf2md:page=N -->` comment that starts every page. */
+	keepPageMarkers: boolean;
 	/** Ask which pages to convert before every single-PDF conversion. */
 	askForPages: boolean;
 	/** Open the progress window when a conversion starts (it can be closed to run in the background). */
@@ -30,6 +32,7 @@ export const DEFAULT_SETTINGS: Settings = {
 	paddleScale: 2.5,
 	serveCommand: "",
 	pageLinks: "auto",
+	keepPageMarkers: false,
 	askForPages: false,
 	progressWindow: true,
 	splitChapters: false,
@@ -88,6 +91,7 @@ export function buildArgs(pdfAbs: string | string[], s: Settings, outAbs?: strin
 	args.push("--paddle-scale", String(scale));
 	args.push("--serve-command", s.serveCommand.trim() || `${quoteArg(s.pdf2mdPath.trim() || "pdf2md")} serve`);
 	args.push("--page-links", s.pageLinks);
+	if (s.keepPageMarkers) args.push("--page-markers");
 	if (s.splitChapters) args.push("--split-chapters");
 	if (pages && pages.trim()) args.push("--pages", pages.trim());
 	args.push(...splitArgs(s.extraArgs));
