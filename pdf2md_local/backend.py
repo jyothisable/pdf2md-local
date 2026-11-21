@@ -468,7 +468,7 @@ def info(argv: list[str]) -> int:
     from pdf2md_local import convert
     ap = argparse.ArgumentParser(prog="pdf2md info")
     ap.add_argument("pdf", type=Path, nargs="+")
-    ap.add_argument("--pages", help="only these pages, e.g. 10-40 (same as pdf2md --pages)")
+    ap.add_argument("--pages", help="only these pages, e.g. 10-40 or 10-40,60-80,95 (same as pdf2md --pages)")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     rate, measured = read_rate()
@@ -477,8 +477,10 @@ def info(argv: list[str]) -> int:
         total = convert.page_count(pdf) if pdf.is_file() else None
         n = None
         if total:
-            first, last = convert.parse_pages(a.pages, total) if len(a.pdf) == 1 else (1, total)
-            n = (last or total) - first + 1
+            if len(a.pdf) == 1:
+                n = sum((hi or total) - lo + 1 for lo, hi in convert.parse_page_spec(a.pages, total)[0])
+            else:
+                n = total
         files.append({"name": pdf.name, "pages": n, "seconds": None if n is None else round(n * rate + STARTUP_SECONDS)})
     known = [f for f in files if f["pages"]]
     out = {"files": files, "pages": sum(f["pages"] for f in known), "seconds": sum(f["seconds"] for f in known),
@@ -493,6 +495,45 @@ def info(argv: list[str]) -> int:
     return 0
 
 
+def outline_entries(raw: list[dict], total: int) -> list[dict]:
+    """Bookmarks with inclusive page ranges: an entry ends before the next entry at the same or a shallower level."""
+    out = []
+    for i, e in enumerate(raw):
+        nxt = next((x["page"] for x in raw[i + 1:] if x["level"] <= e["level"]), None)
+        last = total if nxt is None else max(e["page"], nxt - 1)
+        out.append({"title": e["title"], "level": e["level"], "first": e["page"], "last": min(last, total)})
+    return out
+
+
+def outline(argv: list[str]) -> int:
+    """The PDF's bookmarks with page ranges, so a reader can pick chapters (`--pages` takes the result)."""
+    from pdf2md_local import convert
+    ap = argparse.ArgumentParser(prog="pdf2md outline")
+    ap.add_argument("pdf", type=Path)
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    if not a.pdf.is_file():
+        sys.exit(f"error: not a file: {a.pdf}")
+    total = convert.page_count(a.pdf)
+    if not total:
+        sys.exit(f"error: cannot read the page count of {a.pdf}")
+    try:
+        raw = convert.read_pdf_outline(a.pdf)
+    except (ImportError, OSError, ValueError, RuntimeError):
+        raw = []
+    entries = outline_entries(raw, total)
+    rate, measured = read_rate()
+    if a.json:
+        print(json.dumps({"pages": total, "sec_per_page": rate, "measured": measured, "entries": entries}))
+    elif not entries:
+        print(f"{a.pdf.name}: {total} pages, no bookmarks")
+    else:
+        for e in entries:
+            span = f"p. {e['first']}" if e["first"] == e["last"] else f"pp. {e['first']}\u2013{e['last']}"
+            print(f"{'  ' * (e['level'] - 1)}{e['title']}  ({span})")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pdf2md " + argv[0], epilog=(
         f"llama.cpp is pinned to build {LLAMA_CPP_TAG}; set env PDF2MD_LLAMA_TAG to use another release tag.")
@@ -502,6 +543,8 @@ def main(argv: list[str]) -> int:
         return serve()
     if argv[0] == "info":
         return info(argv[1:])
+    if argv[0] == "outline":
+        return outline(argv[1:])
     if argv[0] == "selftest":
         ap.add_argument("--server", default=os.environ.get("PDF2MD_PADDLE_SERVER", DEFAULT_SERVER))
         return selftest(ap.parse_args(argv[1:]).server)

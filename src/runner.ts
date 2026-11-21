@@ -1,6 +1,8 @@
 // Pure helpers: no Obsidian or Node imports, so they can be unit-tested with plain `node --test`.
 
 export type PageLinks = "auto" | "on" | "off";
+/** Auto/on/off choice passed to the tool only when it is not auto. */
+export type Tri = "auto" | "on" | "off";
 
 export interface Settings {
 	/** Name or full path of the `pdf2md` command (installed with `uv tool install`; see the README). */
@@ -12,6 +14,10 @@ export interface Settings {
 	/** Command that starts the server if nothing answers; empty = `pdf2md serve`. The tool stops it again when done. */
 	serveCommand: string;
 	pageLinks: PageLinks;
+	/** Theorem-like paragraphs as callouts. Auto = on for Obsidian-style output. */
+	callouts: Tri;
+	/** Cross-references (Eq. (3.2), Figure 4.1, Theorem 2.1) as links. Auto = on for Obsidian-style output. */
+	crossLinks: Tri;
 	/** Keep the hidden `<!-- pdf2md:page=N -->` comment that starts every page. */
 	keepPageMarkers: boolean;
 	/** Ask for confirmation before conversions estimated to take at least this many minutes (0 = never ask). */
@@ -34,6 +40,8 @@ export const DEFAULT_SETTINGS: Settings = {
 	paddleScale: 2.5,
 	serveCommand: "",
 	pageLinks: "auto",
+	callouts: "auto",
+	crossLinks: "auto",
 	keepPageMarkers: false,
 	confirmOverMinutes: 5,
 	askForPages: false,
@@ -48,7 +56,9 @@ export function migrateSettings(saved: Record<string, unknown> | null | undefine
 	const out: Settings = { ...DEFAULT_SETTINGS };
 	for (const key of Object.keys(DEFAULT_SETTINGS) as (keyof Settings)[]) {
 		const v = saved?.[key];
-		if (typeof v === typeof DEFAULT_SETTINGS[key]) (out as unknown as Record<string, unknown>)[key] = v;
+		if (typeof v !== typeof DEFAULT_SETTINGS[key]) continue;
+		if ((key === "callouts" || key === "crossLinks" || key === "pageLinks") && v !== "auto" && v !== "on" && v !== "off") continue;
+		(out as unknown as Record<string, unknown>)[key] = v;
 	}
 	return out;
 }
@@ -94,6 +104,8 @@ export function buildArgs(pdfAbs: string | string[], s: Settings, outAbs?: strin
 	args.push("--paddle-scale", String(scale));
 	args.push("--serve-command", s.serveCommand.trim() || `${quoteArg(s.pdf2mdPath.trim() || "pdf2md")} serve`);
 	args.push("--page-links", s.pageLinks);
+	if (s.callouts !== "auto") args.push("--callouts", s.callouts);
+	if (s.crossLinks !== "auto") args.push("--cross-links", s.crossLinks);
 	if (s.keepPageMarkers) args.push("--page-markers");
 	if (s.splitChapters) args.push("--split-chapters");
 	if (pages && pages.trim()) args.push("--pages", pages.trim());
@@ -279,12 +291,42 @@ export function batchLabel(p: Progress | null): string {
 	return p && p.kind === "pdf" && p.total > 1 ? `PDF ${p.n}/${p.total}` : "";
 }
 
-/** Valid page-range text: empty (all pages), "7", or "10-40". */
-export function validPages(text: string): boolean {
+/** Parse page text ("7", "10-40", or a list like "10-40,60-80,95") into ranges; null if invalid. Empty = no ranges. */
+export function parsePageList(text: string): [number, number][] | null {
 	const t = text.trim();
-	if (!t) return true;
-	const m = /^(\d+)(?:\s*-\s*(\d+))?$/.exec(t);
-	return !!m && +m[1] >= 1 && (m[2] === undefined || +m[2] >= +m[1]);
+	if (!t) return [];
+	const out: [number, number][] = [];
+	for (const part of t.split(",")) {
+		const m = /^\s*(\d+)(?:\s*-\s*(\d+))?\s*$/.exec(part);
+		if (!m) return null;
+		const a = +m[1];
+		const b = m[2] === undefined ? a : +m[2];
+		if (a < 1 || b < a) return null;
+		out.push([a, b]);
+	}
+	return out;
+}
+
+/** Sort ranges and merge those that overlap or touch. */
+export function mergeRanges(ranges: [number, number][]): [number, number][] {
+	const sorted = ranges.map((r) => [...r] as [number, number]).sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+	const out: [number, number][] = [];
+	for (const r of sorted) {
+		const last = out[out.length - 1];
+		if (last && r[0] <= last[1] + 1) last[1] = Math.max(last[1], r[1]);
+		else out.push(r);
+	}
+	return out;
+}
+
+/** Ranges as the tool's page spec: "10-40,60-80,95". */
+export function formatRanges(ranges: [number, number][]): string {
+	return ranges.map(([a, b]) => (a === b ? String(a) : `${a}-${b}`)).join(",");
+}
+
+/** Valid page text: empty (all pages), "7", "10-40", or a comma-separated list such as "10-40,60-80,95". */
+export function validPages(text: string): boolean {
+	return parsePageList(text) !== null;
 }
 
 /** Environment for the tool: PATH extended so GUI-launched Obsidian finds pdf2md and llama-server. */
@@ -426,6 +468,13 @@ export interface ConvertResult {
 	formulaImages: { page: number; note: string }[];
 	mathWarnings: { note: string; count: number }[];
 	cacheKept: boolean;
+	/** Absent when the tool is older than 0.7.0. */
+	callouts?: number;
+	crossLinks?: number;
+	/** Links made from the PDF's own internal link annotations (0.7.0+ tools only). */
+	pdfLinks?: number;
+	/** Web links kept from the PDF. */
+	urlLinks?: number;
 }
 
 const isInt = (x: unknown): x is number => typeof x === "number" && Number.isInteger(x);
@@ -456,7 +505,7 @@ export function parseResult(line: string): ConvertResult | null {
 		const o = obj(e);
 		if (o && isStr(o.note) && isInt(o.count) && o.count > 0) mathWarnings.push({ note: o.note, count: o.count });
 	}
-	return {
+	const res: ConvertResult = {
 		pdf: d.pdf,
 		output: d.output,
 		folder: isStr(d.folder) ? d.folder : null,
@@ -466,6 +515,28 @@ export function parseResult(line: string): ConvertResult | null {
 		mathWarnings,
 		cacheKept: d.cache_kept === true,
 	};
+	if (isInt(d.callouts) && d.callouts >= 0) res.callouts = d.callouts;
+	if (isInt(d.cross_links) && d.cross_links >= 0) res.crossLinks = d.cross_links;
+	if (isInt(d.pdf_links) && d.pdf_links >= 0) res.pdfLinks = d.pdf_links;
+	if (isInt(d.url_links) && d.url_links >= 0) res.urlLinks = d.url_links;
+	return res;
+}
+
+/** "12 callouts, 48 cross-reference links (30 from the PDF's own links), 5 web links"; null when nothing was reported or all are zero. */
+export function enrichmentSummary(r: ConvertResult): string | null {
+	const n = (x: number | undefined) => x ?? 0;
+	if (n(r.callouts) + n(r.crossLinks) + n(r.pdfLinks) + n(r.urlLinks) <= 0) return null;
+	const plural = (k: number, word: string) => `${k} ${word}${k === 1 ? "" : "s"}`;
+	const parts: string[] = [];
+	if (r.callouts !== undefined) parts.push(plural(r.callouts, "callout"));
+	if (r.crossLinks !== undefined) {
+		const own = n(r.pdfLinks) > 0 ? ` (${r.pdfLinks} from the PDF's own links)` : "";
+		parts.push(`${plural(r.crossLinks, "cross-reference link")}${own}`);
+	} else if (n(r.pdfLinks) > 0) {
+		parts.push(`${plural(n(r.pdfLinks), "link")} from the PDF's own links`);
+	}
+	if (r.urlLinks !== undefined && r.urlLinks > 0) parts.push(plural(r.urlLinks, "web link"));
+	return parts.join(", ");
 }
 
 /** Does this result have anything the user should look at? */
@@ -519,5 +590,124 @@ export function pickPdf(notePath: string, candidates: string[]): { pick: string 
 /** The page range to reuse when retrying, from a note's `pages` frontmatter (or the job's own value): undefined = all pages. */
 export function retryPages(value: unknown): string | undefined {
 	const t = typeof value === "number" ? String(value) : typeof value === "string" ? value.trim() : "";
-	return t && validPages(t) ? t.replace(/\s+/g, "") : undefined;
+	const ranges = t ? parsePageList(t) : null;
+	return ranges && ranges.length ? formatRanges(mergeRanges(ranges)) : undefined;
+}
+
+// ---- chapter picker (bookmarks) -----------------------------------------------------------------------------
+
+export interface OutlineEntry {
+	title: string;
+	level: number;
+	first: number;
+	last: number;
+}
+
+export interface Outline {
+	pages: number;
+	secPerPage: number;
+	measured: boolean;
+	entries: OutlineEntry[];
+}
+
+/** Arguments for `pdf2md outline`. */
+export function buildOutlineArgs(pdfAbs: string): string[] {
+	return ["outline", "--json", pdfAbs];
+}
+
+/** Parse `pdf2md outline --json`; null if the output is not what the tool prints. */
+export function parseOutline(text: string): Outline | null {
+	try {
+		const d = JSON.parse(text) as Record<string, unknown> | null;
+		if (!d || typeof d !== "object" || Array.isArray(d) || !Array.isArray(d.entries)) return null;
+		if (!isInt(d.pages) || d.pages < 0) return null;
+		const spp = typeof d.sec_per_page === "number" && Number.isFinite(d.sec_per_page) && d.sec_per_page >= 0 ? d.sec_per_page : null;
+		if (spp === null) return null;
+		const entries: OutlineEntry[] = [];
+		for (const e of d.entries) {
+			const o = e as Record<string, unknown> | null;
+			if (!o || typeof o !== "object" || typeof o.title !== "string" || !isInt(o.level) || !isInt(o.first) || !isInt(o.last)) return null;
+			if (o.level < 1 || o.first < 1 || o.last < o.first) return null;
+			entries.push({ title: o.title, level: o.level, first: o.first, last: o.last });
+		}
+		return { pages: d.pages, secPerPage: spp, measured: d.measured === true, entries };
+	} catch {
+		return null;
+	}
+}
+
+/** Indexes of all entries below entry `i` (the following entries that are deeper), in document order. */
+export function descendants(entries: OutlineEntry[], i: number): number[] {
+	const out: number[] = [];
+	for (let j = i + 1; j < entries.length && entries[j].level > entries[i].level; j++) out.push(j);
+	return out;
+}
+
+/** Indexes of the direct children of entry `i`. */
+export function childrenOf(entries: OutlineEntry[], i: number): number[] {
+	return descendants(entries, i).filter((j) => entries[j].level === entries[i].level + 1);
+}
+
+/** Index of the parent entry, or -1 for a top-level one. */
+export function parentOf(entries: OutlineEntry[], i: number): number {
+	for (let j = i - 1; j >= 0; j--) if (entries[j].level < entries[i].level) return j;
+	return -1;
+}
+
+/**
+ * Check or uncheck entry `i`: its descendants follow, and each ancestor is checked exactly when all of its
+ * descendants are. Returns a new set.
+ */
+export function toggleEntry(entries: OutlineEntry[], selected: ReadonlySet<number>, i: number, checked: boolean): Set<number> {
+	const out = new Set(selected);
+	for (const j of [i, ...descendants(entries, i)]) {
+		if (checked) out.add(j);
+		else out.delete(j);
+	}
+	for (let p = parentOf(entries, i); p >= 0; p = parentOf(entries, p)) {
+		if (descendants(entries, p).every((j) => out.has(j))) out.add(p);
+		else out.delete(p);
+	}
+	return out;
+}
+
+/** Display state of a row: a parent with only some of its descendants selected is "mixed" (indeterminate). */
+export function checkState(entries: OutlineEntry[], selected: ReadonlySet<number>, i: number): "checked" | "unchecked" | "mixed" {
+	if (selected.has(i)) return "checked";
+	return descendants(entries, i).some((j) => selected.has(j)) ? "mixed" : "unchecked";
+}
+
+/** Merged page ranges covered by the selected entries. */
+export function selectionRanges(entries: OutlineEntry[], selected: Iterable<number>): [number, number][] {
+	const r: [number, number][] = [];
+	for (const i of selected) if (entries[i]) r.push([entries[i].first, entries[i].last]);
+	return mergeRanges(r);
+}
+
+/** The `--pages` value for the selected entries, merged like the tool does ("10-40,60-80,95"); "" if none. */
+export function selectionToPages(entries: OutlineEntry[], selected: Iterable<number>): string {
+	return formatRanges(selectionRanges(entries, selected));
+}
+
+export function countPages(ranges: [number, number][]): number {
+	return ranges.reduce((n, [a, b]) => n + (b - a + 1), 0);
+}
+
+/** Estimated seconds for a number of pages. */
+export function estimateSeconds(pages: number, secPerPage: number): number {
+	return Math.max(0, pages) * Math.max(0, secPerPage);
+}
+
+/** "pp. 13–28 · about 2 min" for one row. */
+export function rowLabel(e: OutlineEntry, secPerPage: number): string {
+	const n = e.last - e.first + 1;
+	const range = n === 1 ? `p. ${e.first}` : `pp. ${e.first}–${e.last}`;
+	return `${range} · ${formatDuration(estimateSeconds(n, secPerPage))}`;
+}
+
+/** "120 pages · about 6 min", or "Nothing selected". */
+export function totalLabel(ranges: [number, number][], secPerPage: number): string {
+	const n = countPages(ranges);
+	if (!n) return "Nothing selected";
+	return `${n} page${n === 1 ? "" : "s"} · about ${formatDuration(estimateSeconds(n, secPerPage))}`;
 }

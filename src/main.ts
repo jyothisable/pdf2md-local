@@ -20,8 +20,19 @@ import * as path from "path";
 import {
 	ConvertResult,
 	DEFAULT_SETTINGS,
+	Outline,
 	SetupCheck,
+	Tri,
 	buildInfoArgs,
+	buildOutlineArgs,
+	checkState,
+	enrichmentSummary,
+	parseOutline,
+	rowLabel,
+	selectionRanges,
+	selectionToPages,
+	toggleEntry,
+	totalLabel,
 	estimateText,
 	needsConfirmation,
 	parseEstimate,
@@ -131,6 +142,16 @@ export default class Pdf2MdPlugin extends Plugin {
 			},
 		});
 		this.addCommand({
+			id: "convert-chapters",
+			name: "Convert chapters…",
+			checkCallback: (checking) => {
+				const active = this.app.workspace.getActiveFile();
+				if (!active || !isPdf(active)) return false;
+				if (!checking) void this.chooseChapters(active);
+				return true;
+			},
+		});
+		this.addCommand({
 			id: "convert-several",
 			name: "Convert several PDFs…",
 			callback: () => {
@@ -178,6 +199,12 @@ export default class Pdf2MdPlugin extends Plugin {
 							.setTitle("Convert to Markdown")
 							.setIcon("file-text")
 							.onClick(() => this.convertOne(file)),
+					);
+					menu.addItem((item) =>
+						item
+							.setTitle("Convert chapters…")
+							.setIcon("list-checks")
+							.onClick(() => void this.chooseChapters(file)),
 					);
 				} else if (file instanceof TFolder) {
 					const pdfs = collectPdfs(file);
@@ -298,6 +325,27 @@ export default class Pdf2MdPlugin extends Plugin {
 
 	private askPages(file: TFile) {
 		new PageRangeModal(this.app, file.name, (pages) => void this.convertFiles([file], pages)).open();
+	}
+
+	/** Read the PDF's bookmarks and let the user pick chapters; the choice becomes a page list for the normal path. */
+	private async chooseChapters(file: TFile) {
+		const base = this.basePath();
+		if (!base) {
+			new Notice("PDF to Markdown only works with a local (desktop) vault.");
+			return;
+		}
+		if (this.job || this.starting) {
+			new Notice("PDF to Markdown: a conversion is already running.");
+			return;
+		}
+		if (!(await this.checkSetup())) return;
+		const out = await this.runTool(buildOutlineArgs(path.join(base, file.path)), 120000);
+		const outline = out === null ? null : parseOutline(out);
+		if (!outline) {
+			new Notice("PDF to Markdown: could not read the bookmarks. The installed pdf2md may be older than this plugin: see \"Check the pdf2md setup\".", 10000);
+			return;
+		}
+		new ChapterModal(this.app, file.name, outline, (pages) => void this.convertFiles([file], pages), () => this.askPages(file)).open();
 	}
 
 	/** Never throws: every failure is shown as a notice. The slot is claimed at once and released on every early exit. */
@@ -850,7 +898,7 @@ class PageRangeModal extends Modal {
 		this.titleEl.setText(`Convert ${this.name}`);
 		const go = () => {
 			if (!validPages(this.value)) {
-				new Notice("Use a page number or a range like 10-40, or leave it empty for all pages.");
+				new Notice("Use a page, a range like 10-40, or a list like 10-40,60-80,95. Leave it empty for all pages.");
 				return;
 			}
 			this.close();
@@ -858,7 +906,7 @@ class PageRangeModal extends Modal {
 		};
 		new Setting(this.contentEl)
 			.setName("Pages")
-			.setDesc("For example 10-40, or a single page. Leave empty to convert the whole PDF.")
+			.setDesc("For example 10-40, a single page, or a list such as 10-40,60-80,95. Leave empty to convert the whole PDF.")
 			.addText((t) => {
 				t.setPlaceholder("all pages").onChange((v) => (this.value = v));
 				t.inputEl.addEventListener("keydown", (e) => {
@@ -876,6 +924,94 @@ class PageRangeModal extends Modal {
 	}
 }
 
+
+/** Pick chapters from the PDF's bookmarks as a tree of checkboxes. */
+class ChapterModal extends Modal {
+	private selected = new Set<number>();
+	private boxes: HTMLInputElement[] = [];
+	private totalEl!: HTMLElement;
+	private goBtn!: HTMLButtonElement;
+
+	constructor(
+		app: App,
+		private name: string,
+		private outline: Outline,
+		private onSubmit: (pages: string) => void,
+		private onPageRange: () => void,
+	) {
+		super(app);
+	}
+
+	onOpen() {
+		this.titleEl.setText(`Convert chapters of ${this.name}`);
+		const el = this.contentEl;
+		const { entries, secPerPage } = this.outline;
+		if (!entries.length) {
+			el.createEl("p", { text: "This PDF has no bookmarks, so its chapters cannot be listed. You can enter a page range instead." });
+			new Setting(el)
+				.addButton((b) => b.setButtonText("Enter page range…").setCta().onClick(() => {
+					this.close();
+					this.onPageRange();
+				}))
+				.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+			return;
+		}
+		const bar = el.createDiv({ cls: "pdf2md-bar" });
+		const all = bar.createEl("button", { text: "Select all" });
+		all.addEventListener("click", () => {
+			this.selected = new Set(entries.map((_, i) => i));
+			this.sync();
+		});
+		const none = bar.createEl("button", { text: "Select none" });
+		none.addEventListener("click", () => {
+			this.selected = new Set();
+			this.sync();
+		});
+		this.totalEl = bar.createSpan({ cls: "pdf2md-count" });
+		const list = el.createDiv({ cls: "pdf2md-list pdf2md-chapters" });
+		entries.forEach((e, i) => {
+			const row = list.createEl("label", { cls: "pdf2md-row pdf2md-chapter" });
+			row.style.setProperty("--pdf2md-level", String(e.level - 1));
+			const box = row.createEl("input", { type: "checkbox" });
+			box.addEventListener("change", () => {
+				this.selected = toggleEntry(entries, this.selected, i, box.checked);
+				this.sync();
+			});
+			this.boxes.push(box);
+			row.createSpan({ cls: "pdf2md-chapter-title", text: e.title });
+			row.createSpan({ cls: "pdf2md-muted pdf2md-chapter-info", text: rowLabel(e, secPerPage) });
+		});
+		const buttons = el.createDiv({ cls: "pdf2md-buttons" });
+		this.goBtn = buttons.createEl("button", { text: "Convert", cls: "mod-cta" });
+		this.goBtn.addEventListener("click", () => {
+			const pages = selectionToPages(entries, this.selected);
+			if (!pages) return;
+			this.close();
+			this.onSubmit(pages);
+		});
+		const cancel = buttons.createEl("button", { text: "Cancel" });
+		cancel.addEventListener("click", () => this.close());
+		this.sync();
+	}
+
+	/** Update the checkboxes (including the partly selected state), the total and the Convert button. */
+	private sync() {
+		const { entries, secPerPage } = this.outline;
+		this.boxes.forEach((box, i) => {
+			const st = checkState(entries, this.selected, i);
+			box.checked = st === "checked";
+			box.indeterminate = st === "mixed";
+		});
+		const ranges = selectionRanges(entries, this.selected);
+		this.totalEl.setText(totalLabel(ranges, secPerPage));
+		this.goBtn.disabled = ranges.length === 0;
+	}
+
+	onClose() {
+		this.contentEl.empty();
+		this.boxes = [];
+	}
+}
 
 /** Progress bar, stage, elapsed time and ETA, then the result and a review report. Closing it leaves the conversion running; the status bar brings it back. */
 class ProgressModal extends Modal {
@@ -1033,6 +1169,13 @@ class ProgressModal extends Modal {
 			for (const f of missing) ul.createEl("li", { text: f.path });
 		}
 
+		const extras = v.results.map((r) => ({ r, text: enrichmentSummary(r) })).filter((x) => x.text);
+		if (extras.length) {
+			el.createEl("h4", { text: "Callouts and links" });
+			const ul = el.createEl("ul", { cls: "pdf2md-report-list" });
+			for (const x of extras) ul.createEl("li", { text: v.results.length > 1 ? `${baseName(x.r.pdf)}: ${x.text}` : (x.text ?? "") });
+		}
+
 		el.createEl("h4", { text: "Needs review" });
 		const items = reviewItems(v.results);
 		if (!items.length) {
@@ -1122,6 +1265,10 @@ class Pdf2MdSettingTab extends PluginSettingTab {
 			.addText((t) => t.setPlaceholder("e.g. Imports").setValue(s.outputFolder).onChange(async (v) => { s.outputFolder = v; await save(); }));
 		new Setting(containerEl).setName("Links to PDF pages").setDesc("Adds [[file.pdf#page=N]] under each heading. Auto = on.")
 			.addDropdown((d) => d.addOptions({ auto: "Auto", on: "Always", off: "Never" }).setValue(s.pageLinks).onChange(async (v) => { s.pageLinks = v as PageLinks; await save(); }));
+		new Setting(containerEl).setName("Theorem callouts").setDesc("Shows theorems, definitions, proofs and similar paragraphs as callouts. Auto = on for Obsidian-style output, off for plain Markdown.")
+			.addDropdown((d) => d.addOptions({ auto: "Auto", on: "On", off: "Off" }).setValue(s.callouts).onChange(async (v) => { s.callouts = v as Tri; await save(); }));
+		new Setting(containerEl).setName("Cross-reference links").setDesc("Turns references such as Eq. (3.2), Figure 4.1 or Theorem 2.1 into links to their targets. Auto = on for Obsidian-style output, off for plain Markdown.")
+			.addDropdown((d) => d.addOptions({ auto: "Auto", on: "On", off: "Off" }).setValue(s.crossLinks).onChange(async (v) => { s.crossLinks = v as Tri; await save(); }));
 		new Setting(containerEl).setName("Keep hidden page markers").setDesc("Keeps an invisible <!-- pdf2md:page=N --> comment at the start of every page. Off by default; the visible page links are not affected.")
 			.addToggle((t) => t.setValue(s.keepPageMarkers).onChange(async (v) => { s.keepPageMarkers = v; await save(); }));
 		new Setting(containerEl).setName("Show a progress window").setDesc("Opens when a conversion starts, with a progress bar and the time left. Close it to keep working: the conversion continues, and clicking the status bar reopens it.")

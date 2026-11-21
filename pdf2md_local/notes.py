@@ -149,11 +149,16 @@ def split_book_paged(md: str, book: str, keep_markers: bool = False) -> list[dic
         if n["pages"] and _TRAILING_PAGE.search(n["body"]):
             notes[i + 1]["pages"].insert(0, n["pages"].pop())
     if not keep_markers:
-        for n in notes:
-            n["body"] = strip_page_markers(n["body"] + "\n").strip("\n")
-        if notes[0]["kind"] == "front" and not notes[0]["body"].strip():
-            notes.pop(0)
+        strip_note_markers(notes)
     return notes
+
+
+def strip_note_markers(notes: list[dict]) -> None:
+    """Remove the page markers from every note body (in place); an emptied front-matter note is dropped."""
+    for n in notes:
+        n["body"] = strip_page_markers(n["body"] + "\n").strip("\n")
+    if notes and notes[0]["kind"] == "front" and not notes[0]["body"].strip():
+        notes.pop(0)
 
 
 def note_index_for_page(notes: list[dict], page: int) -> int:
@@ -268,7 +273,7 @@ def unique_path(p: Path) -> Path:
     return q
 
 
-PAGE_MARKER = re.compile(r"^<!-- pdf2md:page=\d+ -->[ \t]*\n(?:[ \t]*\n)*", re.M)
+PAGE_MARKER = re.compile(r"^(?:>[ \t]?)*<!-- pdf2md:page=\d+ -->[ \t]*\n(?:(?:>[ \t]*)?[ \t]*\n)*", re.M)  # also inside a callout
 
 
 def strip_page_markers(md: str) -> str:

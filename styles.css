@@ -98,3 +98,14 @@
 .pdf2md-report-list { margin: 0 0 var(--size-4-2); padding-left: var(--size-4-5); }
 .pdf2md-review { margin-bottom: var(--size-4-2); }
 .pdf2md-review-title { font-weight: var(--font-semibold); }
+
+.pdf2md-chapter {
+	padding-left: calc(var(--pdf2md-level, 0) * var(--size-4-5));
+}
+.pdf2md-chapter-title {
+	flex: 1;
+}
+.pdf2md-chapter-info {
+	white-space: nowrap;
+	font-size: var(--font-smaller);
+}

@@ -34,10 +34,32 @@ def tidy_tex(seg: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", seg)
 
 
+TAG_ANY = re.compile(r"\\tag(\*?)\s*\{((?:[^{}]|\{[^{}]*\})*)\}")
+TAG_NUMBER = re.compile(r"[A-Z]?\d+(?:\.\d+)*[a-z]?|[A-Z](?:\.\d+)+[a-z]?")
+
+
+def normalize_tags(body: str) -> str:
+    """`\\tag*{(1.2)}` (paddlex's merged formula number) -> `\\tag{1.2}`: parentheses/spaces dropped, the starred
+    form unstarred. A tag whose content is not an equation number is dropped; several tags keep the last. Idempotent."""
+    found = list(TAG_ANY.finditer(body))
+    if not found:
+        return body
+    raw = found[-1].group(2)
+    raw = re.sub(r"\\(?:text|mathrm|textrm|mbox)\s*\{([^{}]*)\}", r"\1", raw)
+    raw = re.sub(r"\s+", "", raw).strip("()[]")
+    raw = re.sub(r"(?<=\d)\.(?=\d)", ".", raw)
+    stripped = TAG_ANY.sub("", body).rstrip()
+    return stripped + (r" \tag{" + raw + "}" if TAG_NUMBER.fullmatch(raw) else "")
+
+
 def tidy_block(body: str) -> str:
     """Fix formula artefacts: spacing, stray & / equation numbers."""
-    body = body.strip()
+    body = normalize_tags(body.strip())
     body = TRAILING_TAG.sub(lambda m: r" \tag{" + m.group(1).replace(" ", "") + "}", body)
+    tag_text = ""
+    tag = TAG_ANY.search(body)
+    if tag:  # keep the tag out of the spacing clean-up and re-append it unchanged (outside any aligned wrapper)
+        body, tag_text = TAG_ANY.sub("", body).rstrip(), " " + tag.group(0)
     keep: list[str] = []
 
     def stash(m: re.Match) -> str:
@@ -49,7 +71,7 @@ def tidy_block(body: str) -> str:
     body = re.sub(r"\x01(\d+)\x01", lambda m: keep[int(m.group(1))], body)
     if "\\begin" not in body and ("&" in re.sub(r"\\&", "", body) or "\\\\" in body):
         body = "\\begin{aligned}\n" + body.strip() + "\n\\end{aligned}"
-    return body.strip()
+    return (body.strip() + tag_text).strip()
 
 
 LATEX_TOKEN = re.compile(

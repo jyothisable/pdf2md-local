@@ -49,6 +49,9 @@ from pdf2md_local.guards import (  # noqa: F401
     inline_math_problems, native_greek_problems, native_matrix_problems, native_operator_problems,
     native_variable_problems, protect_paddle_result, source_verified_prose,
 )
+from pdf2md_local import pdf_links
+from pdf2md_local.structure import apply_callouts
+from pdf2md_local.xref import add_anchors, link_references
 from pdf2md_local.outline import (  # noqa: F401
     CAPTION_START, CHAPTER_PAIR, CODE_HEADING, HEADING, NUMBERED_HEADING, TRAILING_PAGE, fix_headings, heading_key,
     link_target, normalize_pdf_outline, not_a_heading, read_pdf_outline, repair_pdf_headings, wants_page_link,
@@ -56,12 +59,12 @@ from pdf2md_local.outline import (  # noqa: F401
 from pdf2md_local.notes import (  # noqa: F401
     AMP_ENTITY, BACK_HEADING, CHAPTER_H1, PAGE_MARKER, UNSAFE_NAME, clean_paddle_markdown, find_chapters,
     FAILED_MARKER, failed_marker, html_table_to_md, note_index_for_page, render_index, render_note, safe_name, split_book,
-    split_book_paged, strip_page_markers, table_cell_breaks, yaml_str,
+    split_book_paged, strip_note_markers, strip_page_markers, table_cell_breaks, yaml_str,
     to_plain, unescape_entities, unique_dir, unique_path,
 )
 from pdf2md_local.runner import (  # noqa: F401
     Cache, CacheLock, PACKAGE_PARENT, ServerGuard, WORKER, api_base, convert_resilient, merge_stats, new_stats, openai_chat,
-    paddle_slice, page_count, page_ranges, parse_pages, run_key, worker_command,
+    paddle_slice, page_count, page_ranges, parse_page_spec, parse_pages, run_key, worker_command,
 )
 
 
@@ -106,6 +109,12 @@ def convert_pdf(a: argparse.Namespace, pdf: Path) -> None:
     flavor = a.flavor if a.flavor != "auto" else ("obsidian" if find_vault_root(a.out.expanduser().resolve() if a.out else pdf.parent) else "plain")
     flavor_key = "obsidian"          # checkpoints always hold Obsidian-style text; the flavour is applied when writing
     page_links = a.page_links == "on" or (a.page_links == "auto" and flavor == "obsidian")
+    # structure features are applied to the final text only; like the flavour they are not part of the cache key
+    a.callouts_on = a.callouts == "on" or (a.callouts == "auto" and flavor == "obsidian")
+    a.cross_links_on = a.cross_links == "on" or (a.cross_links == "auto" and flavor == "obsidian")
+    # the PDF's own links: internal ones follow --cross-links under auto; external URLs are always linked unless off
+    a.pdf_internal_on = a.pdf_links == "on" or (a.pdf_links == "auto" and a.cross_links_on)
+    a.pdf_urls_on = a.pdf_links != "off"
     engines = ["paddleocr-vl-1.6"]
 
     out = (a.out.expanduser().resolve() if a.out else pdf.parent)
@@ -116,8 +125,11 @@ def convert_pdf(a: argparse.Namespace, pdf: Path) -> None:
     assets = out.parent / f"{out.stem}_assets"
 
     total = page_count(pdf)
-    first, last = parse_pages(a.pages, total)
-    key = run_key(pdf, batch_pages, first, last, page_links, a.paddle_scale, flavor_key)
+    sel, spec = parse_page_spec(a.pages, total)
+    first, last = sel[0][0], sel[-1][1]
+    # one range keeps the 0.6 key layout; a list is keyed by its normalised spec
+    span = (first, last) if len(sel) == 1 else (spec,)
+    key = run_key(pdf, batch_pages, *span, page_links, a.paddle_scale, flavor_key)
     cache_dir = Path(tempfile.mkdtemp(prefix="pdf2md-")) if a.no_cache else CACHE_ROOT / key
     lock = None
     try:
@@ -125,7 +137,7 @@ def convert_pdf(a: argparse.Namespace, pdf: Path) -> None:
         if not a.no_cache:
             lock = CacheLock(cache_dir)
             lock.acquire()
-        _convert_locked(a, pdf, cache, cache_dir, out, assets, total, first, last, batch_pages, flavor, page_links, engines)
+        _convert_locked(a, pdf, cache, cache_dir, out, assets, total, sel, spec, batch_pages, flavor, page_links, engines)
     finally:
         if a.no_cache:
             shutil.rmtree(cache_dir, ignore_errors=True)
@@ -133,17 +145,26 @@ def convert_pdf(a: argparse.Namespace, pdf: Path) -> None:
             lock.release()
 
 
-def _convert_locked(a, pdf, cache, cache_dir, out, assets, total, first, last, batch_pages, flavor, page_links, engines):
+def _convert_locked(a, pdf, cache, cache_dir, out, assets, total, sel, spec, batch_pages, flavor, page_links, engines):
     t0 = time.time()
-    ranges = page_ranges(last, batch_pages, first)
+    ranges: list[tuple[int, int]] = []
+    base: dict[tuple[int, int], int] = {}      # selected pages that come before each slice
+    before = 0
+    for lo, hi in sel:
+        for r in page_ranges(hi, batch_pages, lo):
+            ranges.append(r)
+            base[r] = before
+            before += (r[1] - r[0] + 1) if hi else 0
+    last = sel[-1][1]
+    selected = before
     resumed = len(list(cache_dir.glob("slice_*.json")))
-    print(f"[1/4] PaddleOCR-VL: {pdf.name} ({(last - first + 1) if last else '?'} of {total or '?'} pages, {len(ranges)} slice(s)"
+    print(f"[1/4] PaddleOCR-VL: {pdf.name} ({selected if last else '?'} of {total or '?'} pages, {len(ranges)} slice(s)"
           + ")" + (f"; resuming, {resumed} slice(s) already done" if resumed else ""))
 
     totals = new_stats()
     failed_pages: set[int] = set()
     pieces: list[str] = []
-    total_pages = (last - first + 1) if last else 0
+    total_pages = selected if last else 0
 
     def progress(done: int) -> None:
         """A machine-readable line for the plugin's progress window: pages finished of pages to convert."""
@@ -161,7 +182,7 @@ def _convert_locked(a, pdf, cache, cache_dir, out, assets, total, first, last, b
             ck = f"slice_{rng[0]}_{rng[1]}"
             hit = cache.get(ck)
             convert_fn = lambda r: paddle_slice(pdf, r, cache.img, a.paddle_server, page_links,
-                                                lambda i, _t, r=r: progress(r[0] - first + i), a.paddle_scale)
+                                                lambda i, _t, r=r: progress(base[r] + i), a.paddle_scale)
             if hit:
                 md, st = hit["md"], hit["stats"]
                 failed_here = sorted(set(hit["failed"]) | {int(x) for x in FAILED_MARKER.findall(md)})
@@ -177,7 +198,7 @@ def _convert_locked(a, pdf, cache, cache_dir, out, assets, total, first, last, b
                 cache.put(ck, {"md": md, "stats": st, "failed": failed_here})
             failed_pages |= set(failed_here)
             totals = merge_stats(totals, st)
-            progress(rng[1] - first + 1)
+            progress(base[rng] + rng[1] - rng[0] + 1)
             md = unescape_entities(normalize_math(md))
             el = time.time() - t0
             eta = f", ETA ~{el / n * (len(ranges) - n) / 60:.0f} min" if len(ranges) > 1 and n < len(ranges) else ""
@@ -217,8 +238,7 @@ def _convert_locked(a, pdf, cache, cache_dir, out, assets, total, first, last, b
             pass
     formula_pages = sorted(set(totals.get("formula_image_pages", [])))
     marked = md                                  # page markers still in; needed to find which note holds a page
-    md = md if a.page_markers else strip_page_markers(md)
-    issues = validate_document(md)
+    issues = validate_document(md if a.page_markers else strip_page_markers(md))
     print(f"[3/4] math check: {len(issues)} problem(s)")
     for ln, why, snip in issues[:20]:
         print(f"  body line {ln}: {why}: {snip}")
@@ -226,7 +246,7 @@ def _convert_locked(a, pdf, cache, cache_dir, out, assets, total, first, last, b
         print(f"  ... {len(issues) - 20} more")
 
     date = dt.date.today().isoformat()
-    notes = split_book_paged(marked, pdf.stem, a.page_markers) if a.split_chapters else None
+    notes = split_book_paged(marked, pdf.stem, True) if a.split_chapters else None
     if a.split_chapters and not notes:
         print("warning: no numbered chapter headings found; writing a single note instead")
     folder = unique_dir(out.with_suffix("")) if notes else None
@@ -244,13 +264,40 @@ def _convert_locked(a, pdf, cache, cache_dir, out, assets, total, first, last, b
 
     written: list[Path] = []
     math_warnings: list[dict] = []
+    plain = flavor == "plain"
+    n_callouts = n_links = n_pdf = n_url = 0
+    # Enrichment runs while the page markers are still in the text (the PDF's links are located by page), then
+    # the markers go (unless --page-markers). Math warnings are counted on the converted text, before callout
+    # prefixes, anchors and links are added.
+    work = notes if notes else [{"file": out.stem, "body": marked.strip("\n")}]
+    for n in work:
+        n["warnings"] = len(validate_document(strip_page_markers(n["body"] + "\n")))
+    if a.callouts_on:
+        for n in work:
+            n["body"], c = apply_callouts(n["body"], plain)
+            n_callouts += c
+    registry = add_anchors(work, plain) if a.cross_links_on else {}
+    if a.pdf_internal_on or a.pdf_urls_on:
+        pages = {p for lo, hi in sel for p in range(lo, hi + 1)}
+        found = pdf_links.read_links(pdf, pages)
+        made = pdf_links.apply_links(work, found, plain, registry, a.pdf_internal_on, a.pdf_urls_on)
+        n_pdf, n_url = made["pdf_links"], made["url_links"]
+    if a.cross_links_on:
+        n_links = link_references(work, registry, plain)
+    if not a.page_markers:
+        if notes:
+            strip_note_markers(notes)
+        else:
+            md = strip_page_markers(work[0]["body"] + "\n")
+    if not notes:
+        md = md if not a.page_markers else work[0]["body"] + "\n"
     formula_images: list[dict] = []
     if notes:
         folder.mkdir(parents=True, exist_ok=True)
         index_stem = "00 Index"
         files = [n["file"] for n in notes]
         for i, n in enumerate(notes):
-            count = len(validate_document(n["body"]))
+            count = n["warnings"]
             text = render_note(n, pdf.stem, pdf.name, files[i - 1] if i else None,
                                files[i + 1] if i + 1 < len(files) else None, index_stem, date, count)
             if flavor == "plain":
@@ -263,7 +310,7 @@ def _convert_locked(a, pdf, cache, cache_dir, out, assets, total, first, last, b
                 math_warnings.append({"note": str(path), "count": count})
         index_path = folder / f"{index_stem}.md"
         with open(index_path, "x", encoding="utf-8") as f:
-            index_text = render_index(notes, pdf.stem, pdf.name, date, failed, f"{first}-{last}" if a.pages else None)
+            index_text = render_index(notes, pdf.stem, pdf.name, date, failed, spec)
             f.write(to_plain(index_text, "assets", os.path.relpath(pdf, folder)) if flavor == "plain" else index_text)
         written = [index_path] + [n["path"] for n in notes]
         formula_images = [{"page": p, "note": str(notes[note_index_for_page(notes, p)]["path"])} for p in formula_pages]
@@ -277,7 +324,7 @@ def _convert_locked(a, pdf, cache, cache_dir, out, assets, total, first, last, b
                  f"converted: {date}\n"
                  f"converter: {' + '.join(engines)}\n"
                  f"math_warnings: {len(issues)}\n"
-                 + (f"pages: \"{first}-{last}\"\n" if a.pages else "")
+                 + (f"pages: \"{spec}\"\n" if spec else "")
                  + (f"pages_failed: {failed}\n" if failed else "")
                  + "tags: [pdf_import]\n---\n\n")
         with open(out, "x", encoding="utf-8") as f:  # exclusive: never overwrite
@@ -289,6 +336,9 @@ def _convert_locked(a, pdf, cache, cache_dir, out, assets, total, first, last, b
             math_warnings.append({"note": str(out), "count": len(issues)})
         formula_images = [{"page": p, "note": str(out)} for p in formula_pages]
         print(f"[4/4] wrote {out} ({time.time() - t0:.0f}s)")
+    if a.callouts_on or a.cross_links_on or n_pdf or n_url:
+        extra = (f", {n_pdf} PDF link(s)" if a.pdf_internal_on or n_pdf else "") + (f", {n_url} URL link(s)" if a.pdf_urls_on and n_url else "")
+        print(f"      structure: {n_callouts} callout(s), {n_links} cross-reference link(s){extra}")
     if assets.exists():
         print(f"      figures: {assets}")
     keep = bool(a.keep_cache and not a.no_cache) or bool(failed)
@@ -300,6 +350,7 @@ def _convert_locked(a, pdf, cache, cache_dir, out, assets, total, first, last, b
         "pdf": str(pdf), "output": str(main_note), "folder": str(folder) if folder else None,
         "notes": [str(p) for p in written], "pages_failed": failed, "formula_images": formula_images,
         "math_warnings": math_warnings, "cache_kept": keep and not a.no_cache,
+        "callouts": n_callouts, "cross_links": n_links, "pdf_links": n_pdf, "url_links": n_url,
     }, ensure_ascii=True), flush=True)
 
 
@@ -313,7 +364,7 @@ def main(argv: list[str] | None = None) -> None:
         signal.signal(signal.SIGTERM, lambda _s, _f: sys.exit(143))
     except (ValueError, OSError):      # not the main thread
         pass
-    if argv and argv[0] in ("setup", "check", "serve", "selftest", "info"):
+    if argv and argv[0] in ("setup", "check", "serve", "selftest", "info", "outline"):
         from pdf2md_local import backend
         sys.exit(backend.main(argv))
     ap = argparse.ArgumentParser(
@@ -326,6 +377,16 @@ def main(argv: list[str] | None = None) -> None:
                          "auto = obsidian when the output is inside an Obsidian vault (default)")
     ap.add_argument("--page-links", choices=("auto", "on", "off"), default="auto",
                     help="add a link to the PDF page under each heading; auto = in the obsidian flavour")
+    ap.add_argument("--callouts", choices=("auto", "on", "off"), default="auto",
+                    help="theorem/lemma/definition/proof/... paragraphs as callouts (plain flavour: blockquotes); "
+                         "auto = in the obsidian flavour")
+    ap.add_argument("--cross-links", choices=("auto", "on", "off"), default="auto",
+                    help="anchor numbered equations, figures, tables and theorems and link 'Eq. (3.2)'-style "
+                         "references to them; auto = in the obsidian flavour")
+    ap.add_argument("--pdf-links", choices=("auto", "on", "off"), default="auto",
+                    help="use the PDF's own link annotations: internal links (to figures, equations, sections, "
+                         "references) become links in the notes (auto = when cross-links are on) and external URLs "
+                         "become Markdown links (auto = on in both flavours); off = neither")
     ap.add_argument("--paddle-server", default=os.environ.get("PDF2MD_PADDLE_SERVER", DEFAULT_PADDLE_SERVER),
                     help="address of the llama-server running PaddleOCR-VL (default: $PDF2MD_PADDLE_SERVER, "
                          f"{DEFAULT_PADDLE_SERVER})")
@@ -337,7 +398,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--serve-wait", type=int, default=180, help="seconds to wait for --serve-command's server")
     ap.add_argument("--pages-per-batch", type=int, default=None,
                     help=f"convert big PDFs in slices of N pages (default {PADDLE_PAGES_PER_BATCH}; 0 = whole file)")
-    ap.add_argument("--pages", help="convert only these pages, e.g. 10-40 (1-based, inclusive)")
+    ap.add_argument("--pages", help="convert only these pages, e.g. 10-40 or 10-40,60-80,95 (1-based, inclusive)")
     ap.add_argument("--split-chapters", action="store_true",
                     help="write a folder of notes (contents, front matter, one note per chapter, back matter) "
                          "instead of one big note; needs numbered chapter headings")

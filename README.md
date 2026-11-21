@@ -14,6 +14,11 @@ whole books split into linked chapter notes. Use it as a **command-line tool** (
 
 - Inline/display LaTeX (`$…$`, `$$…$$`), figures and tables.
 - **Chapter splitting** with a contents index and Previous / Contents / Next links.
+- **Convert chosen chapters** from the PDF's bookmarks (`pdf2md outline`, `--pages 10-40,60-80`).
+- **Linked cross-references:** "Figure 1.2", "Eq. (3.4)", "Theorem 2.1", "Section 1.2" become links to the figure,
+  numbered equation, theorem or heading, across chapter notes. The PDF's own links are used first where it has them;
+  its web links are kept.
+- **Theorem callouts:** Theorem, Lemma, Definition, Proof, Example… become Obsidian callouts.
 - PDF bookmarks guide heading hierarchy; optional page links connect notes to the source PDF.
 - Source-backed checks retry damaged equations or keep an exact source image instead of guessing.
 - Batch conversion, page ranges, checkpoint/resume and progress with ETA.
@@ -55,6 +60,8 @@ checked against the digest GitHub publishes. `--llama skip` leaves llama.cpp alo
 pdf2md serve                                   # terminal 1: start the model server (leave running)
 pdf2md book.pdf --split-chapters               # terminal 2: convert (-o out/, --pages 60-79, --flavor plain|obsidian)
 pdf2md a.pdf b.pdf -o out/                     # batch
+pdf2md outline book.pdf                        # the bookmarks with page ranges, to pick chapters
+pdf2md book.pdf --pages 19-84,155-195          # several ranges in one conversion
 pdf2md --help
 ```
 
@@ -63,6 +70,10 @@ Or let the tool start and stop the server for you: `pdf2md book.pdf --serve-comm
 If some pages could not be read, they are listed in the note's `pages_failed` frontmatter, the checkpoint is kept, and
 **running the same command again re-reads only those pages**. Pages whose formulas were kept as source pictures are
 reported too. Cancelling (Ctrl-C or SIGTERM) stops the page worker and any model server the run started.
+
+Cross-reference links and theorem callouts are on for `obsidian` output and off for `plain` output; turn them on or off
+with `--cross-links` and `--callouts` (`auto|on|off`), and the PDF's own links with `--pdf-links`. Display equations keep
+their printed number as `\tag{1.2}`.
 
 Outside an Obsidian vault the output is `plain` Markdown; inside a vault (a folder containing `.obsidian`) it is
 `obsidian` unless you pass `--flavor`. In a vault, a backup command of your choice can run first
@@ -80,7 +91,8 @@ Desktop only. After installing and checking the command-line tool as above:
    copy `main.js`, `manifest.json` and `styles.css` from the [latest release](../../releases/latest) to
    `<vault>/.obsidian/plugins/pdf2md-local/` (or use [BRAT](https://github.com/TfTHacker/obsidian42-brat)).
 2. In the plugin settings press **Check**; anything missing is listed with a command you can copy.
-3. Right-click a PDF or folder → **Convert to Markdown**, or use the command palette (page ranges, several PDFs, cancel).
+3. Right-click a PDF or folder → **Convert to Markdown**, or **Convert chapters…** to tick chapters from the PDF's
+   bookmarks (with page ranges and estimated times), or use the command palette (page ranges, several PDFs, cancel).
    Before a long conversion the plugin shows the page count and estimated time and asks you to confirm.
 
 The progress window shows pages, stage and ETA; **Run in background** keeps the conversion running and the status bar

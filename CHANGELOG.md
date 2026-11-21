@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0
+
+- **Choose chapters:** `pdf2md outline [--json]` lists the PDF's bookmarks with page ranges; `--pages` (and `pdf2md info --pages`) accepts lists such as `10-40,60-80,95`. Plugin: **Convert chapters…** shows the bookmark tree with checkboxes, page ranges and estimated times.
+- **Equation numbers kept:** display equations keep their printed number as `\tag{1.2}`.
+- **Cross-reference links** (`--cross-links`, default on for Obsidian output): numbered equations, figures, tables and theorem-like statements get block anchors, and references such as "Figure 1.2", "(1.2)", "Eq. (3.4)", "Theorem 2.1", "Section 1.2" and "Chapter 3" link to them, across chapter notes.
+- **The PDF's own links** (`--pdf-links`) are used first where the PDF has them, with text-pattern matching for the rest; the PDF's web links are kept as Markdown links.
+- **Theorem callouts** (`--callouts`, default on for Obsidian output): Theorem, Lemma, Proposition, Corollary, Definition, Example, Remark, Exercise and Proof become callouts.
+- Plugin: settings for callouts and cross-reference links; the finished-job report shows how many callouts and links were made.
+
 ## 0.6.0
 
 **Fixes**

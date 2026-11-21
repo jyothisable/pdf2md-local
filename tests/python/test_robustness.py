@@ -155,7 +155,7 @@ class ResultAndFrontmatterTests(unittest.TestCase):
             note = str((Path(d) / "paper.md").resolve())
             self.assertEqual(r, {"pdf": str(Path(d, "paper.pdf").resolve()), "output": note, "folder": None, "notes": [note],
                                  "pages_failed": [], "formula_images": [{"page": 1, "note": note}], "math_warnings": [],
-                                 "cache_kept": False})
+                                 "cache_kept": False, "callouts": 0, "cross_links": 0, "pdf_links": 0, "url_links": 0})
             self.assertTrue(env.out.getvalue().rstrip().endswith(env.out.getvalue().splitlines()[-1]))
             self.assertTrue(env.out.getvalue().splitlines()[-1].startswith("RESULT "))
 

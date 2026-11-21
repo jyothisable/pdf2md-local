@@ -7,6 +7,8 @@ import {
 	initialState, reduce, fractionOverall, etaSeconds, formatDuration, etaLabel, statusBarText,
 	updateCommand, versionWarning, checkOutputFolder, parseResult, needsReview, reviewItems, retryOutput, pickPdf,
 	dirName, baseName, retryPages,
+	parsePageList, mergeRanges, parseOutline, buildOutlineArgs, selectionToPages, toggleEntry, checkState, descendants,
+	childrenOf, parentOf, estimateSeconds, rowLabel, totalLabel, enrichmentSummary,
 } from "../.test-build/runner.mjs";
 
 test("splitArgs honours quotes and empty input", () => {
@@ -139,8 +141,8 @@ test("parseLine and statusText understand batches", () => {
 });
 
 test("validPages accepts the tool's page-range syntax only", () => {
-	for (const ok of ["", "  ", "7", "10-40", " 3 - 9 "]) assert.ok(validPages(ok), ok);
-	for (const bad of ["0", "0-4", "9-3", "a", "1-", "-5", "1,2", "1-2-3"]) assert.ok(!validPages(bad), bad);
+	for (const ok of ["", "  ", "7", "10-40", " 3 - 9 ", "10-40,60-80,95", "5, 1-2 ,9"]) assert.ok(validPages(ok), ok);
+	for (const bad of ["0", "0-4", "9-3", "a", "1-", "-5", "1,", ",2", "1,,2", "3,1-0", "1-2-3"]) assert.ok(!validPages(bad), bad);
 });
 
 test("toolEnv extends PATH without losing the rest", () => {
@@ -310,9 +312,116 @@ test("retryPages feeds the original page range into the retry arguments", () => 
 	assert.equal(retryPages("10-40"), "10-40");
 	assert.equal(retryPages(" 10 - 40 "), "10-40");
 	assert.equal(retryPages(7), "7");
-	for (const none of [undefined, null, "", "  ", "9-3", "x", "1,2", []]) assert.equal(retryPages(none), undefined, String(none));
+	for (const none of [undefined, null, "", "  ", "9-3", "x", "1,", "5,3-1", []]) assert.equal(retryPages(none), undefined, String(none));
 	const a = buildArgs("/v/a.pdf", DEFAULT_SETTINGS, "/v/B/a.md", retryPages("10-40"));
 	assert.equal(a[a.indexOf("--pages") + 1], "10-40");
 	assert.equal(a[a.indexOf("-o") + 1], "/v/B/a.md");
 	assert.ok(!buildArgs("/v/a.pdf", DEFAULT_SETTINGS, "/v/B/a.md", retryPages(undefined)).includes("--pages"));
+});
+
+test("retryPages accepts and normalises the list syntax", () => {
+	assert.equal(retryPages("10-40, 60-80 ,95"), "10-40,60-80,95");
+	assert.equal(retryPages("60-80,10-40,41-50"), "10-50,60-80");
+	assert.equal(retryPages("95"), "95");
+});
+
+test("buildArgs passes callouts and cross-links only when not auto", () => {
+	const a = buildArgs("/v/a.pdf", DEFAULT_SETTINGS);
+	assert.ok(!a.includes("--callouts") && !a.includes("--cross-links"));
+	const b = buildArgs("/v/a.pdf", { ...DEFAULT_SETTINGS, callouts: "off", crossLinks: "on" });
+	assert.equal(b[b.indexOf("--callouts") + 1], "off");
+	assert.equal(b[b.indexOf("--cross-links") + 1], "on");
+});
+
+test("migrateSettings: new options default to auto and reject bad values", () => {
+	assert.equal(migrateSettings({ splitChapters: true }).callouts, "auto");
+	assert.equal(migrateSettings({}).crossLinks, "auto");
+	assert.equal(migrateSettings({ callouts: "on", crossLinks: "off" }).callouts, "on");
+	assert.equal(migrateSettings({ callouts: "maybe" }).callouts, "auto");
+});
+
+test("parseResult tolerates missing callouts/cross_links and reads them when present", () => {
+	const old = parseResult('RESULT {"pdf":"/a.pdf","output":"/a.md"}');
+	assert.equal(old.callouts, undefined);
+	assert.equal(enrichmentSummary(old), null);
+	const r = parseResult('RESULT {"pdf":"/a.pdf","output":"/a.md","callouts":12,"cross_links":48}');
+	assert.equal(enrichmentSummary(r), "12 callouts, 48 cross-reference links");
+	const one = parseResult('RESULT {"pdf":"/a.pdf","output":"/a.md","callouts":1,"cross_links":0}');
+	assert.equal(enrichmentSummary(one), "1 callout, 0 cross-reference links");
+	assert.equal(enrichmentSummary(parseResult('RESULT {"pdf":"/a.pdf","output":"/a.md","callouts":0,"cross_links":0}')), null);
+});
+
+const OUT = { pages: 100, sec_per_page: 3, measured: false, entries: [
+	{ title: "Part I", level: 1, first: 1, last: 50 },
+	{ title: "1 Intro", level: 2, first: 5, last: 20 },
+	{ title: "1.1 Scope", level: 3, first: 5, last: 10 },
+	{ title: "1.2 Method", level: 3, first: 11, last: 20 },
+	{ title: "2 Basics", level: 2, first: 21, last: 50 },
+	{ title: "Part II", level: 1, first: 51, last: 100 },
+] };
+
+test("outline: args and parsing", () => {
+	assert.deepEqual(buildOutlineArgs("/v/a.pdf"), ["outline", "--json", "/v/a.pdf"]);
+	const o = parseOutline(JSON.stringify(OUT));
+	assert.equal(o.pages, 100);
+	assert.equal(o.secPerPage, 3);
+	assert.equal(o.entries.length, 6);
+	assert.deepEqual(parseOutline('{"pages":5,"sec_per_page":3,"measured":true,"entries":[]}').entries, []);
+	for (const bad of ["nope", "[]", "{}", '{"pages":5,"sec_per_page":3,"entries":[{"title":"x","level":0,"first":1,"last":2}]}',
+		'{"pages":5,"sec_per_page":3,"entries":[{"title":"x","level":1,"first":3,"last":2}]}',
+		'{"pages":5,"entries":[]}']) assert.equal(parseOutline(bad), null, bad);
+});
+
+test("outline tree helpers", () => {
+	const e = OUT.entries.map((x) => ({ ...x }));
+	assert.deepEqual(descendants(e, 0), [1, 2, 3, 4]);
+	assert.deepEqual(childrenOf(e, 0), [1, 4]);
+	assert.deepEqual(childrenOf(e, 5), []);
+	assert.equal(parentOf(e, 3), 1);
+	assert.equal(parentOf(e, 5), -1);
+	let sel = toggleEntry(e, new Set(), 1, true);
+	assert.deepEqual([...sel].sort(), [1, 2, 3]);
+	assert.equal(checkState(e, sel, 0), "mixed");
+	assert.equal(checkState(e, sel, 1), "checked");
+	assert.equal(checkState(e, sel, 4), "unchecked");
+	sel = toggleEntry(e, sel, 4, true);                  // all children of Part I now selected: parent follows
+	assert.equal(checkState(e, sel, 0), "checked");
+	sel = toggleEntry(e, sel, 2, false);                 // unchecking a leaf clears its ancestors
+	assert.equal(checkState(e, sel, 1), "mixed");
+	assert.equal(checkState(e, sel, 0), "mixed");
+	assert.equal(checkState(e, toggleEntry(e, sel, 0, false), 3), "unchecked");
+});
+
+test("selectionToPages merges like the tool", () => {
+	const e = OUT.entries;
+	assert.equal(selectionToPages(e, []), "");
+	assert.equal(selectionToPages(e, [2, 3]), "5-20");                 // adjacent ranges merge
+	assert.equal(selectionToPages(e, [5, 2]), "5-10,51-100");
+	assert.equal(selectionToPages(e, [0, 1]), "1-50");                 // overlap
+	const single = [{ title: "x", level: 1, first: 95, last: 95 }, { title: "y", level: 1, first: 10, last: 40 }, { title: "z", level: 1, first: 60, last: 80 }];
+	assert.equal(selectionToPages(single, [0, 1, 2]), "10-40,60-80,95");
+	assert.equal(selectionToPages(single, [0]), "95");
+	assert.deepEqual(mergeRanges([[5, 6], [1, 2], [3, 4]]), [[1, 6]]);
+	assert.deepEqual(parsePageList("2, 4-5"), [[2, 2], [4, 5]]);
+});
+
+test("estimates for the picker", () => {
+	assert.equal(estimateSeconds(10, 3.4), 34);
+	assert.equal(rowLabel({ title: "t", level: 1, first: 13, last: 28 }, 3.75), "pp. 13–28 · 1 min");
+	assert.equal(rowLabel({ title: "t", level: 1, first: 4, last: 4 }, 3), "p. 4 · 3 s");
+	assert.equal(totalLabel([], 3), "Nothing selected");
+	assert.equal(totalLabel([[1, 20], [30, 40]], 3), "31 pages · about 2 min");
+});
+
+test("enrichmentSummary includes the PDF's own links and web links", () => {
+	const r = parseResult('RESULT {"pdf":"/a.pdf","output":"/a.md","callouts":12,"cross_links":48,"pdf_links":30,"url_links":5}');
+	assert.equal(r.pdfLinks, 30);
+	assert.equal(r.urlLinks, 5);
+	assert.equal(enrichmentSummary(r), "12 callouts, 48 cross-reference links (30 from the PDF's own links), 5 web links");
+	const one = parseResult('RESULT {"pdf":"/a.pdf","output":"/a.md","callouts":0,"cross_links":1,"pdf_links":0,"url_links":1}');
+	assert.equal(enrichmentSummary(one), "0 callouts, 1 cross-reference link, 1 web link");
+	assert.equal(enrichmentSummary(parseResult('RESULT {"pdf":"/a.pdf","output":"/a.md","url_links":2}')), "2 web links");
+	const bad = parseResult('RESULT {"pdf":"/a.pdf","output":"/a.md","pdf_links":"x","url_links":-1}');
+	assert.equal(bad.pdfLinks, undefined);
+	assert.equal(bad.urlLinks, undefined);
 });

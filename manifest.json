@@ -1,7 +1,7 @@
 {
 	"id": "pdf2md-local",
 	"name": "PDF to Markdown (pdf2md-local)",
-	"version": "0.6.0",
+	"version": "0.7.0",
 	"minAppVersion": "1.5.7",
 	"description": "Convert PDFs to Markdown on your computer: LaTeX maths, figures, tables and chapter notes. Needs the pdf2md tool.",
 	"author": "jyothisable",

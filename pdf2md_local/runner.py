@@ -140,20 +140,42 @@ def page_ranges(total: int | None, batch: int, first: int = 1) -> list[tuple[int
     return [(lo, min(lo + batch - 1, total)) for lo in range(first, total + 1, batch)]
 
 
-def parse_pages(spec: str | None, total: int | None) -> tuple[int, int | None]:
-    """'A-B' or 'A' -> (first, last), clamped to the document; None -> the whole file."""
-    if not spec:
-        return 1, total
-    m_ = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+))?\s*", spec)
-    if not m_:
-        sys.exit(f"error: --pages must look like 5 or 10-40, got '{spec}'")
-    lo = int(m_.group(1))
-    hi = int(m_.group(2) or lo)
+def parse_page_spec(spec: str | None, total: int | None) -> tuple[list[tuple[int, int | None]], str | None]:
+    """'10-40,60-80,95' -> (sorted, merged, clamped [(first, last)], normalised spec); None -> the whole file.
+
+    Overlapping or adjacent ranges are merged; ranges past the end of the document are clamped or dropped."""
+    if not spec or not spec.strip():
+        return [(1, total)], None
+    found: list[tuple[int, int]] = []
+    for part in spec.split(","):
+        m_ = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+))?\s*", part)
+        if not m_:
+            sys.exit(f"error: --pages must look like 5, 10-40 or 10-40,60-80,95, got '{spec}'")
+        lo = int(m_.group(1))
+        hi = int(m_.group(2) or lo)
+        if lo < 1 or hi < lo:
+            sys.exit(f"error: page range '{part.strip()}' in --pages '{spec}' is not valid (pages count from 1, low-high)")
+        found.append((lo, hi))
     if total:
-        hi = min(hi, total)
-    if lo < 1 or hi < lo:
-        sys.exit(f"error: page range {spec} is outside the document ({total or '?'} pages)")
-    return lo, hi
+        found = [(lo, min(hi, total)) for lo, hi in found if lo <= total]
+        if not found:
+            sys.exit(f"error: page range {spec} is outside the document ({total} pages)")
+    merged: list[list[int]] = []
+    for lo, hi in sorted(found):
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    ranges = [(lo, hi) for lo, hi in merged]
+    norm = ",".join(str(lo) if lo == hi else f"{lo}-{hi}" for lo, hi in ranges)
+    return list(ranges), norm
+
+
+def parse_pages(spec: str | None, total: int | None) -> tuple[int, int | None]:
+    """'A-B' or 'A' -> (first, last), clamped to the document; None -> the whole file.
+    A list spec gives its overall span (use parse_page_spec for the exact ranges)."""
+    ranges, _ = parse_page_spec(spec, total)
+    return ranges[0][0], ranges[-1][1]
 
 
 def page_count(pdf: Path) -> int | None:

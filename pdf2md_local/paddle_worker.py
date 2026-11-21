@@ -131,7 +131,7 @@ def main() -> None:
                         if not res['model_settings'].get('use_doc_preprocessor'):
                             reports.append(formatting.protect_paddle_result(res,native_text,crop,retry_formula,
                                                                           page_no,outline,repeated_margin))
-                    res.save_to_markdown(save_path=str(dst))
+                    res.save_to_markdown(save_path=str(dst),show_formula_number=True)
                     if a.diagnostics:
                         res.save_to_json(save_path=str(dst))
                 (dst/'safety.json').write_text(json.dumps(reports,indent=2))
