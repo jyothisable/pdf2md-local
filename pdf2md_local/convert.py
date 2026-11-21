@@ -842,6 +842,12 @@ def parse_pages(spec: str | None, total: int | None) -> tuple[int, int | None]:
 
 
 def page_count(pdf: Path) -> int | None:
+    """Number of pages: pypdf (a dependency of this package) first, pypdfium2 if that is all that is installed."""
+    try:
+        from pypdf import PdfReader
+        return len(PdfReader(str(pdf)).pages)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         import pypdfium2
         d = pypdfium2.PdfDocument(str(pdf))
@@ -849,7 +855,7 @@ def page_count(pdf: Path) -> int | None:
             return len(d)
         finally:
             d.close()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
 

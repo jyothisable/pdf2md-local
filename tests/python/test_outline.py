@@ -11,6 +11,19 @@ from pdf2md_local import convert as m  # noqa: E402
 
 class OutlineTests(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec('pypdf'), 'pypdf optional in lightweight test environment')
+    def test_page_count_needs_only_pypdf(self):
+        from pypdf import PdfWriter
+        with tempfile.TemporaryDirectory() as d:
+            w = PdfWriter()
+            for _ in range(3):
+                w.add_blank_page(100, 100)
+            path = Path(d) / 'a.pdf'
+            with open(path, 'wb') as f:
+                w.write(f)
+            self.assertEqual(m.page_count(path), 3)
+            self.assertIsNone(m.page_count(Path(d) / 'missing.pdf'))
+
+    @unittest.skipUnless(importlib.util.find_spec('pypdf'), 'pypdf optional in lightweight test environment')
     def test_read_actual_pdf_destinations(self):
         from pypdf import PdfWriter
         with tempfile.TemporaryDirectory() as d:
