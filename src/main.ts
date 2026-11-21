@@ -553,6 +553,8 @@ class PageRangeModal extends Modal {
 /** Progress bar, stage, elapsed time and ETA. Closing it leaves the conversion running; the status bar brings it back. */
 class ProgressModal extends Modal {
 	private bodyEl!: HTMLElement;
+	private detailsOpen = false;
+	private logScroll: number | null = null;
 
 	constructor(app: App, private plugin: Pdf2MdPlugin, private onGone: () => void) {
 		super(app);
@@ -576,6 +578,8 @@ class ProgressModal extends Modal {
 		const now = v.endedAt ?? Date.now();
 		const s = v.state;
 		const el = this.bodyEl;
+		const oldLog = el.querySelector("pre.pdf2md-log");
+		if (oldLog) this.logScroll = oldLog.scrollTop;   // the view is rebuilt every second: keep what the user was reading
 		el.empty();
 
 		const single = v.files.length === 1;
@@ -604,8 +608,11 @@ class ProgressModal extends Modal {
 		});
 
 		const details = el.createEl("details", { cls: "pdf2md-details" });
+		details.open = this.detailsOpen;
+		details.addEventListener("toggle", () => { this.detailsOpen = details.open; });
 		details.createEl("summary", { text: "Details" });
-		details.createEl("pre", { cls: "pdf2md-log", text: this.plugin.logTail(14) });
+		const log = details.createEl("pre", { cls: "pdf2md-log", text: this.plugin.logTail(14) });
+		if (this.detailsOpen) log.scrollTop = this.logScroll ?? log.scrollHeight;
 
 		const buttons = el.createDiv({ cls: "pdf2md-buttons" });
 		if (v.running) {
