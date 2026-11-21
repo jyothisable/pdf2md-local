@@ -26,11 +26,12 @@ import {
 	buildInfoArgs,
 	buildOutlineArgs,
 	checkState,
+	chapterChoicePages,
+	shouldOfferChapters,
 	enrichmentSummary,
 	parseOutline,
 	rowLabel,
 	selectionRanges,
-	selectionToPages,
 	toggleEntry,
 	totalLabel,
 	estimateText,
@@ -67,6 +68,7 @@ import {
 
 const MAX_LOG_LINES = 3000;
 const KILL_AFTER_MS = 10_000;
+const SETUP_CACHE_MS = 120_000;
 
 const isPdf = (f: TAbstractFile): f is TFile => f instanceof TFile && f.extension.toLowerCase() === "pdf";
 
@@ -113,6 +115,8 @@ export default class Pdf2MdPlugin extends Plugin {
 	private statusEl: HTMLElement | null = null;
 	private view: RunView | null = null;
 	private modal: ProgressModal | null = null;
+	/** A fresh successful setup check, used once by the next conversion start. */
+	private setupCache: { value: { ready: boolean; serverUp: boolean }; at: number } | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -128,8 +132,8 @@ export default class Pdf2MdPlugin extends Plugin {
 			name: "Convert PDF to Markdown",
 			callback: () => {
 				const active = this.app.workspace.getActiveFile();
-				if (active && isPdf(active)) this.convertOne(active);
-				else new PdfPicker(this.app, (f) => this.convertOne(f)).open();
+				if (active && isPdf(active)) void this.convertOne(active);
+				else new PdfPicker(this.app, (f) => void this.convertOne(f)).open();
 			},
 		});
 		this.addCommand({
@@ -198,7 +202,7 @@ export default class Pdf2MdPlugin extends Plugin {
 						item
 							.setTitle("Convert to Markdown")
 							.setIcon("file-text")
-							.onClick(() => this.convertOne(file)),
+							.onClick(() => void this.convertOne(file)),
 					);
 					menu.addItem((item) =>
 						item
@@ -318,9 +322,41 @@ export default class Pdf2MdPlugin extends Plugin {
 
 	// ---- starting a conversion ---------------------------------------------------------------
 
-	private convertOne(file: TFile) {
+	private async convertOne(file: TFile) {
+		if (this.settings.chooseChapters && (await this.offerChapters(file))) return;
 		if (this.settings.askForPages) this.askPages(file);
 		else void this.convertFiles([file]);
+	}
+
+	/**
+	 * Check the setup, read the bookmarks and open the picker with everything selected. Returns true when this
+	 * handled the request (picker shown, or setup problem reported); false to carry on the old way (no bookmarks,
+	 * or an old tool without `outline`).
+	 */
+	private async offerChapters(file: TFile): Promise<boolean> {
+		const base = this.basePath();
+		if (!base || this.job || this.starting) return false;   // convertFiles reports these itself
+		if (!(await this.checkSetupCached())) return true;
+		const outline = await this.readOutline(file, base);
+		if (!shouldOfferChapters(true, outline) || !outline) return false;
+		new ChapterModal(this.app, file.name, outline, {
+			preselectAll: true,
+			onSubmit: (pages) => void this.convertFiles([file], pages),
+			onPageRange: () => this.askPages(file),
+		}).open();
+		return true;
+	}
+
+	private async readOutline(file: TFile, base: string): Promise<Outline | null> {
+		const out = await this.runTool(buildOutlineArgs(path.join(base, file.path)), 120000);
+		return out === null ? null : parseOutline(out);
+	}
+
+	/** A setup check whose success the next conversion start may reuse for a couple of minutes. */
+	private async checkSetupCached(): Promise<boolean> {
+		const ready = await this.checkSetup();
+		this.setupCache = ready ? { value: ready, at: Date.now() } : null;
+		return !!ready;
 	}
 
 	private askPages(file: TFile) {
@@ -338,14 +374,17 @@ export default class Pdf2MdPlugin extends Plugin {
 			new Notice("PDF to Markdown: a conversion is already running.");
 			return;
 		}
-		if (!(await this.checkSetup())) return;
-		const out = await this.runTool(buildOutlineArgs(path.join(base, file.path)), 120000);
-		const outline = out === null ? null : parseOutline(out);
+		if (!(await this.checkSetupCached())) return;
+		const outline = await this.readOutline(file, base);
 		if (!outline) {
 			new Notice("PDF to Markdown: could not read the bookmarks. The installed pdf2md may be older than this plugin: see \"Check the pdf2md setup\".", 10000);
 			return;
 		}
-		new ChapterModal(this.app, file.name, outline, (pages) => void this.convertFiles([file], pages), () => this.askPages(file)).open();
+		new ChapterModal(this.app, file.name, outline, {
+			preselectAll: false,
+			onSubmit: (pages) => void this.convertFiles([file], pages),
+			onPageRange: () => this.askPages(file),
+		}).open();
 	}
 
 	/** Never throws: every failure is shown as a notice. The slot is claimed at once and released on every early exit. */
@@ -371,7 +410,9 @@ export default class Pdf2MdPlugin extends Plugin {
 			return;
 		}
 		if (!files.length) return;
-		const ready = await this.checkSetup();
+		const cached = this.setupCache && Date.now() - this.setupCache.at < SETUP_CACHE_MS ? this.setupCache.value : null;
+		this.setupCache = null;
+		const ready = cached ?? (await this.checkSetup());
 		if (!ready) return;
 		if (!opts.skipEstimate && !(await this.confirmEstimate(files, base, files.length === 1 ? pages : undefined, ready.serverUp))) return;
 
@@ -932,18 +973,22 @@ class ChapterModal extends Modal {
 	private totalEl!: HTMLElement;
 	private goBtn!: HTMLButtonElement;
 
+	/**
+	 * `preselectAll`: the normal conversion flow, which starts with everything selected and offers "Convert whole PDF".
+	 * `onSubmit(undefined)` means the whole PDF, with no page list.
+	 */
 	constructor(
 		app: App,
 		private name: string,
 		private outline: Outline,
-		private onSubmit: (pages: string) => void,
-		private onPageRange: () => void,
+		private opts: { preselectAll: boolean; onSubmit: (pages: string | undefined) => void; onPageRange: () => void },
 	) {
 		super(app);
+		if (opts.preselectAll) this.selected = new Set(outline.entries.map((_, i) => i));
 	}
 
 	onOpen() {
-		this.titleEl.setText(`Convert chapters of ${this.name}`);
+		this.titleEl.setText(this.opts.preselectAll ? `Convert ${this.name}` : `Convert chapters of ${this.name}`);
 		const el = this.contentEl;
 		const { entries, secPerPage } = this.outline;
 		if (!entries.length) {
@@ -951,7 +996,7 @@ class ChapterModal extends Modal {
 			new Setting(el)
 				.addButton((b) => b.setButtonText("Enter page range…").setCta().onClick(() => {
 					this.close();
-					this.onPageRange();
+					this.opts.onPageRange();
 				}))
 				.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
 			return;
@@ -982,12 +1027,25 @@ class ChapterModal extends Modal {
 			row.createSpan({ cls: "pdf2md-muted pdf2md-chapter-info", text: rowLabel(e, secPerPage) });
 		});
 		const buttons = el.createDiv({ cls: "pdf2md-buttons" });
-		this.goBtn = buttons.createEl("button", { text: "Convert", cls: "mod-cta" });
+		const whole = this.opts.preselectAll;
+		if (whole) {
+			const all = buttons.createEl("button", { text: "Convert whole PDF", cls: "mod-cta" });
+			all.addEventListener("click", () => {
+				this.close();
+				this.opts.onSubmit(undefined);
+			});
+			const pages = buttons.createEl("button", { text: "Pages…" });
+			pages.addEventListener("click", () => {
+				this.close();
+				this.opts.onPageRange();
+			});
+		}
+		this.goBtn = buttons.createEl("button", { text: whole ? "Convert selected" : "Convert", cls: whole ? "" : "mod-cta" });
 		this.goBtn.addEventListener("click", () => {
-			const pages = selectionToPages(entries, this.selected);
-			if (!pages) return;
+			const pages = chapterChoicePages(entries, this.selected);
+			if (pages === "") return;
 			this.close();
-			this.onSubmit(pages);
+			this.opts.onSubmit(pages);
 		});
 		const cancel = buttons.createEl("button", { text: "Cancel" });
 		cancel.addEventListener("click", () => this.close());
@@ -1275,6 +1333,8 @@ class Pdf2MdSettingTab extends PluginSettingTab {
 			.addToggle((t) => t.setValue(s.progressWindow).onChange(async (v) => { s.progressWindow = v; await save(); }));
 		new Setting(containerEl).setName("Ask before long conversions").setDesc("Show the page count and estimated time and ask to confirm when a conversion is expected to take at least this many minutes. 0 = never ask (a short notice is still shown).")
 			.addText((t) => t.setValue(String(s.confirmOverMinutes)).onChange(async (v) => { const n = Number(v); s.confirmOverMinutes = Number.isFinite(n) && n >= 0 ? n : DEFAULT_SETTINGS.confirmOverMinutes; await save(); }));
+		new Setting(containerEl).setName("Choose chapters before converting").setDesc("When a PDF has bookmarks, pick chapters before converting. Off = convert the whole PDF (or ask for pages if that is on).")
+			.addToggle((t) => t.setValue(s.chooseChapters).onChange(async (v) => { s.chooseChapters = v; await save(); }));
 		new Setting(containerEl).setName("Ask which pages to convert").setDesc("Prompt for a page range before every single-PDF conversion. The command \"Convert PDF pages…\" always asks.")
 			.addToggle((t) => t.setValue(s.askForPages).onChange(async (v) => { s.askForPages = v; await save(); }));
 

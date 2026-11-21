@@ -44,7 +44,7 @@ llama.cpp: build it yourself. Details, other platforms, update, uninstall and tr
 [docs/install.md](docs/install.md).
 
 ```bash
-uv tool install git+https://github.com/jyothisable/pdf2md-local@0.7.0   # the pdf2md command (a fixed release)
+uv tool install git+https://github.com/jyothisable/pdf2md-local@0.7.1   # the pdf2md command (a fixed release)
 pdf2md setup       # once: worker environment, model, and a prebuilt llama.cpp (llama-server) if you have none
 pdf2md selftest    # converts a bundled 2-page sample and checks the result
 ```
@@ -91,8 +91,8 @@ Desktop only. After installing and checking the command-line tool as above:
    copy `main.js`, `manifest.json` and `styles.css` from the [latest release](../../releases/latest) to
    `<vault>/.obsidian/plugins/pdf2md-local/` (or use [BRAT](https://github.com/TfTHacker/obsidian42-brat)).
 2. In the plugin settings press **Check**; anything missing is listed with a command you can copy.
-3. Right-click a PDF or folder → **Convert to Markdown**, or **Convert chapters…** to tick chapters from the PDF's
-   bookmarks (with page ranges and estimated times), or use the command palette (page ranges, several PDFs, cancel).
+3. Right-click a PDF or folder → **Convert to Markdown**. For a PDF with bookmarks you first pick chapters (all ticked,
+   with page ranges and estimated times; **Convert whole PDF** skips the choice), or use the command palette (page ranges, several PDFs, cancel).
    Before a long conversion the plugin shows the page count and estimated time and asks you to confirm.
 
 The progress window shows pages, stage and ETA; **Run in background** keeps the conversion running and the status bar

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.1
+
+- Plugin: **Convert to Markdown** on a PDF with bookmarks now opens the chapter picker first, with everything selected, **Convert whole PDF**, **Convert selected** and **Pages…**. The setting **Choose chapters before converting** (on by default) turns this step off.
+
 ## 0.7.0
 
 - **Choose chapters:** `pdf2md outline [--json]` lists the PDF's bookmarks with page ranges; `--pages` (and `pdf2md info --pages`) accepts lists such as `10-40,60-80,95`. Plugin: **Convert chapters…** shows the bookmark tree with checkboxes, page ranges and estimated times.

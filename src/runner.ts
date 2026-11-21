@@ -22,6 +22,8 @@ export interface Settings {
 	keepPageMarkers: boolean;
 	/** Ask for confirmation before conversions estimated to take at least this many minutes (0 = never ask). */
 	confirmOverMinutes: number;
+	/** When a PDF has bookmarks, pick chapters before converting. */
+	chooseChapters: boolean;
 	/** Ask which pages to convert before every single-PDF conversion. */
 	askForPages: boolean;
 	/** Open the progress window when a conversion starts (it can be closed to run in the background). */
@@ -44,6 +46,7 @@ export const DEFAULT_SETTINGS: Settings = {
 	crossLinks: "auto",
 	keepPageMarkers: false,
 	confirmOverMinutes: 5,
+	chooseChapters: true,
 	askForPages: false,
 	progressWindow: true,
 	splitChapters: false,
@@ -710,4 +713,18 @@ export function totalLabel(ranges: [number, number][], secPerPage: number): stri
 	const n = countPages(ranges);
 	if (!n) return "Nothing selected";
 	return `${n} page${n === 1 ? "" : "s"} · about ${formatDuration(estimateSeconds(n, secPerPage))}`;
+}
+
+/** Offer the chapter picker first? Needs the setting on and at least two bookmarks (one entry is the whole book). */
+export function shouldOfferChapters(enabled: boolean, outline: Outline | null): boolean {
+	return enabled && outline !== null && outline.entries.length >= 2;
+}
+
+/**
+ * The `--pages` value for a picker choice: undefined when every entry is selected (convert the whole PDF with no
+ * `--pages`, so checkpoints and frontmatter stay as for a plain conversion), "" when nothing is selected.
+ */
+export function chapterChoicePages(entries: OutlineEntry[], selected: ReadonlySet<number>): string | undefined {
+	if (entries.length > 0 && entries.every((_, i) => selected.has(i))) return undefined;
+	return selectionToPages(entries, selected);
 }

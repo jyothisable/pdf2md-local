@@ -8,7 +8,7 @@ import {
 	updateCommand, versionWarning, checkOutputFolder, parseResult, needsReview, reviewItems, retryOutput, pickPdf,
 	dirName, baseName, retryPages,
 	parsePageList, mergeRanges, parseOutline, buildOutlineArgs, selectionToPages, toggleEntry, checkState, descendants,
-	childrenOf, parentOf, estimateSeconds, rowLabel, totalLabel, enrichmentSummary,
+	childrenOf, parentOf, shouldOfferChapters, chapterChoicePages, estimateSeconds, rowLabel, totalLabel, enrichmentSummary,
 } from "../.test-build/runner.mjs";
 
 test("splitArgs honours quotes and empty input", () => {
@@ -424,4 +424,22 @@ test("enrichmentSummary includes the PDF's own links and web links", () => {
 	const bad = parseResult('RESULT {"pdf":"/a.pdf","output":"/a.md","pdf_links":"x","url_links":-1}');
 	assert.equal(bad.pdfLinks, undefined);
 	assert.equal(bad.urlLinks, undefined);
+});
+
+test("chapter picker in the normal flow: when offered and what it converts", () => {
+	const o = parseOutline(JSON.stringify(OUT));
+	const one = parseOutline(JSON.stringify({ ...OUT, entries: [OUT.entries[0]] }));
+	assert.equal(shouldOfferChapters(true, o), true);
+	assert.equal(shouldOfferChapters(false, o), false);
+	assert.equal(shouldOfferChapters(true, one), false);          // a single bookmark is the whole book
+	assert.equal(shouldOfferChapters(true, null), false);         // old tool: fall back silently
+	assert.equal(shouldOfferChapters(true, parseOutline('{"pages":3,"sec_per_page":3,"entries":[]}')), false);
+	const e = o.entries;
+	assert.equal(chapterChoicePages(e, new Set(e.map((_, i) => i))), undefined);   // everything: no --pages
+	assert.equal(chapterChoicePages(e, new Set([5])), "51-100");
+	assert.equal(chapterChoicePages(e, new Set()), "");
+	assert.equal(chapterChoicePages([], new Set()), "");
+	assert.equal(DEFAULT_SETTINGS.chooseChapters, true);
+	assert.equal(migrateSettings({ splitChapters: true }).chooseChapters, true);
+	assert.equal(migrateSettings({ chooseChapters: false }).chooseChapters, false);
 });
