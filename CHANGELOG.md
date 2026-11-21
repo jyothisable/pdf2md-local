@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.2
+
+- Progress window: the Details section stays open (and keeps its scroll position) while the view refreshes.
+
 ## 0.4.1
 
 - Fix: the page count was read with a library that only the worker environment has, so conversions without `--pages` (the plugin default) reported no progress or ETA and the whole PDF ran as one unbounded slice. It now uses `pypdf`.
