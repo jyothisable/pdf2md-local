@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0
+
+- **One-command setup:** `pdf2md setup` also downloads a prebuilt, checksum-verified llama.cpp (`llama-server`) for your system when none is found (`--llama auto|cuda|vulkan|cpu|skip`, `--llama-only`).
+- **`pdf2md selftest`:** converts a bundled CC0 two-page sample and checks the result. `examples/` has its source and the expected output.
+- **Estimates before converting:** `pdf2md info [--json]` reports pages and estimated time, learning your machine's speed from past runs. The plugin shows it (and asks to confirm above a threshold, default 5 minutes) before every conversion.
+- **Plugin setup window:** **Check** lists what is ready or missing, with copyable commands.
+
 ## 0.4.4
 
 - The hidden `<!-- pdf2md:page=N -->` comments are no longer written to notes. `--page-markers` (plugin: **Keep hidden page markers**) restores them.

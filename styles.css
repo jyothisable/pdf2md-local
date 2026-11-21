@@ -84,3 +84,11 @@
 	justify-content: flex-end;
 	margin-top: var(--size-4-4);
 }
+
+.pdf2md-check { margin: 4px 0; }
+.pdf2md-ok { color: var(--text-success); font-weight: 600; }
+.pdf2md-missing { color: var(--text-error); font-weight: 600; }
+.pdf2md-optional { color: var(--text-muted); font-weight: 600; }
+.pdf2md-problem { color: var(--text-error); }
+.pdf2md-command { display: flex; gap: 8px; align-items: center; margin: 4px 0 10px; }
+.pdf2md-command code { flex: 1; user-select: all; overflow-x: auto; white-space: nowrap; }

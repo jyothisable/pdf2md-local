@@ -1604,6 +1604,11 @@ def convert_pdf(a: argparse.Namespace, pdf: Path) -> None:
         print(f"warning: PDF outline unavailable; using extracted headings ({type(exc).__name__})")
     if failed_pages:
         print(f"warning: {len(failed_pages)} page(s) could not be converted: {sorted(failed_pages)}")
+    if not resumed and total_pages:
+        try:
+            backend.record_rate(total_pages, time.time() - t0)
+        except Exception:  # noqa: BLE001  (a speed estimate must never fail a conversion)
+            pass
     if not a.page_markers:
         md = strip_page_markers(md)
     issues = validate_document(md)
@@ -1667,7 +1672,7 @@ def convert_pdf(a: argparse.Namespace, pdf: Path) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] in ("setup", "check", "serve"):
+    if argv and argv[0] in ("setup", "check", "serve", "selftest", "info"):
         from pdf2md_local import backend
         sys.exit(backend.main(argv))
     ap = argparse.ArgumentParser(

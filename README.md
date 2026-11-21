@@ -20,17 +20,21 @@ whole books split into linked chapter notes. Use it as a **command-line tool** (
 **Model:** PaddleOCR-VL-1.6 served by llama.cpp, with the recommended **2.5 Balanced** page resolution. The tested
 setup used about **3 GB VRAM** on a **16 GB GPU**; an 8 GB card is expected to fit but is untested.
 
-## Install (Linux)
+## Install
 
-Requirements: [uv](https://docs.astral.sh/uv/), a GPU-enabled [llama.cpp](https://github.com/ggml-org/llama.cpp)
-`llama-server` on your `PATH`, about 1 GB for the model and a few GB for Python packages. Details and other platforms:
+You need [uv](https://docs.astral.sh/uv/), a GPU (NVIDIA recommended) and about 2 GB of disk for the model plus a few
+GB for Python packages and the llama.cpp download. Details, other platforms and troubleshooting:
 [docs/install.md](docs/install.md).
 
 ```bash
 uv tool install git+https://github.com/jyothisable/pdf2md-local   # the pdf2md command
-pdf2md setup      # once: worker environment and model download (the only step that installs anything)
-pdf2md check      # verifies everything is ready
+pdf2md setup       # once: worker environment, model, and a prebuilt llama.cpp (llama-server) if you have none
+pdf2md selftest    # converts a bundled 2-page sample and checks the result
 ```
+
+`pdf2md setup` is the only step that downloads anything. It picks the llama.cpp build for your system (CUDA, Vulkan,
+Metal or CPU) from the official releases and verifies its checksum; `--llama skip` leaves llama.cpp alone.
+`pdf2md check` shows what is ready at any time, and `pdf2md info book.pdf` estimates the time before you convert.
 
 ## Use
 
@@ -48,7 +52,7 @@ Outside an Obsidian vault the output is `plain` Markdown; inside a vault (a fold
 (`PDF2MD_BACKUP_COMMAND` or `--backup-command`); nothing is run by default.
 
 The `PROGRESS <done> <total>` lines on standard output are a stable, machine-readable progress feed.
-`pdf2md check --json` prints the readiness report that the plugin uses.
+`pdf2md check --json` and `pdf2md info --json` print the readiness report and time estimate that the plugin uses.
 
 ## Obsidian plugin
 
@@ -57,8 +61,9 @@ Desktop only. After installing and checking the command-line tool as above:
 1. Install **PDF to Markdown (pdf2md-local)** from **Settings → Community plugins** once it is listed, or for now
    copy `main.js`, `manifest.json` and `styles.css` from the [latest release](../../releases/latest) to
    `<vault>/.obsidian/plugins/pdf2md-local/` (or use [BRAT](https://github.com/TfTHacker/obsidian42-brat)).
-2. In the plugin settings press **Check** and follow any instruction it shows.
+2. In the plugin settings press **Check**; anything missing is listed with a command you can copy.
 3. Right-click a PDF or folder → **Convert to Markdown**, or use the command palette (page ranges, several PDFs, cancel).
+   Before a long conversion the plugin shows the page count and estimated time and asks you to confirm.
 
 The progress window shows pages, stage and ETA; **Run in background** keeps the conversion running and the status bar
 reopens it.

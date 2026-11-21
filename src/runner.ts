@@ -14,6 +14,8 @@ export interface Settings {
 	pageLinks: PageLinks;
 	/** Keep the hidden `<!-- pdf2md:page=N -->` comment that starts every page. */
 	keepPageMarkers: boolean;
+	/** Ask for confirmation before conversions estimated to take at least this many minutes (0 = never ask). */
+	confirmOverMinutes: number;
 	/** Ask which pages to convert before every single-PDF conversion. */
 	askForPages: boolean;
 	/** Open the progress window when a conversion starts (it can be closed to run in the background). */
@@ -33,6 +35,7 @@ export const DEFAULT_SETTINGS: Settings = {
 	serveCommand: "",
 	pageLinks: "auto",
 	keepPageMarkers: false,
+	confirmOverMinutes: 5,
 	askForPages: false,
 	progressWindow: true,
 	splitChapters: false,
@@ -115,6 +118,48 @@ export function parseCheck(text: string): { ready: boolean; checks: SetupCheck[]
 	} catch {
 		return null;
 	}
+}
+
+export interface Estimate {
+	files: { name: string; pages: number | null; seconds: number | null }[];
+	pages: number;
+	seconds: number;
+	unknown: number;
+	sec_per_page: number;
+	measured: boolean;
+}
+
+/** Parse `pdf2md info --json`; null if the output is not what the tool prints. */
+export function parseEstimate(text: string): Estimate | null {
+	try {
+		const d = JSON.parse(text) as Partial<Estimate> | null;
+		if (!d || !Array.isArray(d.files) || typeof d.pages !== "number" || typeof d.seconds !== "number") return null;
+		return d as Estimate;
+	} catch {
+		return null;
+	}
+}
+
+/** Arguments for `pdf2md info`: PDFs, and the page range when a single PDF is converted. */
+export function buildInfoArgs(pdfAbs: string[], pages?: string): string[] {
+	const args = ["info", "--json", ...pdfAbs];
+	if (pages && pages.trim() && pdfAbs.length === 1) args.push("--pages", pages.trim());
+	return args;
+}
+
+/** One line for a notice or the confirmation window. */
+export function estimateText(e: Estimate, serverRunning: boolean): string {
+	const unit = e.pages === 1 ? "page" : "pages";
+	const time = e.pages > 0 ? `about ${formatDuration(e.seconds)}` : "time unknown";
+	const speed = e.measured ? "from your recent conversions" : "a typical GPU speed";
+	const more = e.unknown ? `, plus ${e.unknown} PDF${e.unknown === 1 ? "" : "s"} of unknown length` : "";
+	const server = serverRunning ? "The model server is already running." : "The model server will be started first.";
+	return `${e.pages} ${unit}${more}: ${time} (${speed}). ${server}`;
+}
+
+/** Should the user be asked before starting? */
+export function needsConfirmation(e: Estimate, thresholdMinutes: number): boolean {
+	return thresholdMinutes > 0 && e.seconds >= thresholdMinutes * 60;
 }
 
 /** What to tell the user when the setup is incomplete, or null if a conversion can start. */

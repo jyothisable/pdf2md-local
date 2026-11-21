@@ -55,9 +55,20 @@ def models_present() -> bool:
     return all((model_dir() / f).is_file() and (model_dir() / f).stat().st_size > 0 for f in MODEL_FILES)
 
 
+def llama_dir() -> Path:
+    return data_dir() / "llama.cpp"
+
+
+def _installed_llama() -> str | None:
+    name = "llama-server.exe" if os.name == "nt" else "llama-server"
+    found = sorted(llama_dir().rglob(name)) if llama_dir().is_dir() else []
+    return str(found[-1]) if found else None
+
+
 def llama_server() -> str | None:
+    """LLAMA_SERVER, then PATH, then the build that `pdf2md setup` downloaded."""
     cmd = os.environ.get("LLAMA_SERVER", "llama-server")
-    return shutil.which(cmd) or (cmd if Path(cmd).is_file() else None)
+    return shutil.which(cmd) or (cmd if Path(cmd).is_file() else None) or _installed_llama()
 
 
 def server_reachable(url: str = DEFAULT_SERVER, timeout: float = 2.0) -> bool:
@@ -85,7 +96,7 @@ def status(server: str = DEFAULT_SERVER) -> list[dict]:
          "detail": f"PaddleOCR-VL-1.6 model files in {model_dir()}", "fix": "pdf2md setup"},
         {"id": "llama-server", "ok": llama_server() is not None, "required": False,
          "detail": "llama.cpp `llama-server` on PATH (needed unless a server is already running)",
-         "fix": "install llama.cpp (https://github.com/ggml-org/llama.cpp), or set LLAMA_SERVER"},
+         "fix": "pdf2md setup   (downloads a prebuilt llama.cpp), or install it yourself / set LLAMA_SERVER"},
         {"id": "server", "ok": server_reachable(server), "required": False,
          "detail": f"model server at {server}",
          "fix": "run `pdf2md serve` in another terminal, or pass --serve-command 'pdf2md serve'"},
@@ -108,6 +119,110 @@ def status_required() -> list[dict]:
     ]
 
 
+def _driver_cuda() -> tuple[int, int] | None:
+    """The CUDA version the NVIDIA driver supports, from `nvidia-smi`, or None without an NVIDIA GPU."""
+    import re
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return None
+    r = subprocess.run([exe], capture_output=True, text=True)
+    m = re.search(r"CUDA (?:UMD )?Version:\s*(\d+)\.(\d+)", r.stdout)
+    return (int(m[1]), int(m[2])) if m else None
+
+
+def pick_llama_assets(names: list[str], system: str, machine: str, cuda: tuple[int, int] | None,
+                      backend_choice: str = "auto", has_vulkan: bool = False) -> list[str] | None:
+    """Choose the llama.cpp release archive(s) (binary, plus the CUDA runtime if needed) from a release's file names."""
+    import re
+    arm = machine in ("arm64", "aarch64")
+    x64 = machine in ("x86_64", "amd64", "AMD64")
+    if system == "Darwin":
+        want = "macos-arm64" if arm else "macos-x64"
+        hit = [n for n in names if re.fullmatch(rf"llama-b\d+-bin-{want}\.tar\.gz", n)]
+        return hit or None
+    if system not in ("Linux", "Windows") or not x64:
+        return None
+    ext = r"tar\.gz" if system == "Linux" else "zip"
+    osname = "ubuntu" if system == "Linux" else "win"
+    want = backend_choice
+    if want == "auto":
+        want = "cuda" if cuda else ("vulkan" if has_vulkan else "cpu")
+    if want == "cuda":
+        if not cuda:
+            return None
+        cands = []
+        for n in names:
+            m = re.fullmatch(rf"llama-b\d+-bin-{osname}-cuda-(\d+)\.(\d+)-x64\.{ext}", n)
+            if m and (int(m[1]), int(m[2])) <= cuda:
+                cands.append(((int(m[1]), int(m[2])), n))
+        if not cands:
+            return None
+        ver, binary = max(cands)
+        runtime = [n for n in names if re.fullmatch(rf"cudart-llama-(?:b\d+-)?bin-{osname}-cuda-{ver[0]}\.{ver[1]}-x64\.{ext}", n)]
+        return [binary] + runtime
+    suffix = {"vulkan": "vulkan-x64", "cpu": "x64" if system == "Linux" else "cpu-x64"}.get(want)
+    hit = [n for n in names if suffix and re.fullmatch(rf"llama-b\d+-bin-{osname}-{suffix}\.{ext}", n)]
+    return hit or None
+
+
+def _safe_extract(archive: Path, dest: Path) -> None:
+    import tarfile
+    import zipfile
+    dest = dest.resolve()
+    if archive.name.endswith(".zip"):
+        with zipfile.ZipFile(archive) as z:
+            for m in z.namelist():
+                if not (dest / m).resolve().is_relative_to(dest):
+                    sys.exit(f"error: unsafe path in {archive.name}")
+            z.extractall(dest)
+    else:
+        with tarfile.open(archive) as t:
+            for m in t.getmembers():
+                if not (dest / m.name).resolve().is_relative_to(dest) or m.islnk() and not (dest / m.linkname).resolve().is_relative_to(dest):
+                    sys.exit(f"error: unsafe path in {archive.name}")
+            t.extractall(dest)   # members were checked above: nothing escapes dest
+
+
+def install_llama(choice: str = "auto") -> None:
+    """Download a prebuilt llama.cpp (llama-server) release into the data folder. Run only by `pdf2md setup`."""
+    import hashlib
+    import platform
+    api = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=8"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(api, headers={"Accept": "application/vnd.github+json"}), timeout=60) as r:
+            releases = json.loads(r.read())
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        sys.exit(f"error: could not list llama.cpp releases ({e}). Install llama.cpp yourself and put llama-server on PATH.")
+    vulkan = bool(shutil.which("vulkaninfo")) or any(Path(p).exists() for p in ("/usr/lib/libvulkan.so.1", "/usr/lib64/libvulkan.so.1", "/usr/lib/x86_64-linux-gnu/libvulkan.so.1"))
+    for rel in releases:
+        assets = {a["name"]: a for a in rel.get("assets", [])}
+        picked = pick_llama_assets(list(assets), platform.system(), platform.machine(), _driver_cuda(), choice, vulkan)
+        if picked:
+            break
+    else:
+        sys.exit("error: no prebuilt llama.cpp matches this system. Build it from source (docs/install.md) "
+                 "and put llama-server on PATH.")
+    dest = llama_dir() / rel["tag_name"]
+    dest.mkdir(parents=True, exist_ok=True)
+    total = sum(assets[n]["size"] for n in picked) // 1_000_000
+    print(f"installing llama.cpp {rel['tag_name']}: {', '.join(picked)} (about {total} MB) into {dest}", flush=True)
+    for name in picked:
+        a = assets[name]
+        file = dest / name
+        _download(a["browser_download_url"], file)
+        digest = (a.get("digest") or "").removeprefix("sha256:")
+        if digest and hashlib.sha256(file.read_bytes()).hexdigest() != digest:
+            file.unlink()
+            sys.exit(f"error: checksum mismatch for {name}; run `pdf2md setup` again.")
+        _safe_extract(file, dest)
+        file.unlink()
+    exe = _installed_llama()
+    if not exe:
+        sys.exit("error: the downloaded archive did not contain llama-server.")
+    os.chmod(exe, 0o755)
+    print(f"llama-server ready: {exe}")
+
+
 def _run(cmd: list[str]) -> None:
     print("+ " + " ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)
@@ -125,8 +240,12 @@ def _download(url: str, dest: Path) -> None:
     part.replace(dest)
 
 
-def setup() -> None:
+def setup(llama: str = "auto", llama_only: bool = False) -> None:
     venv = venv_dir()
+    if llama != "skip" and not llama_server():
+        install_llama(llama)
+    if llama_only:
+        return
     if not worker_imports_ok():
         venv.parent.mkdir(parents=True, exist_ok=True)
         uv = shutil.which("uv")
@@ -149,8 +268,7 @@ def setup() -> None:
                 sys.exit(f"error: could not download {f}: {e}. Run `pdf2md setup` again to resume.")
     print("setup finished.")
     if not llama_server():
-        print("note: `llama-server` (llama.cpp) is not on PATH; install it to serve the model: "
-              "https://github.com/ggml-org/llama.cpp")
+        print("note: no llama-server yet (skipped); install llama.cpp, or run `pdf2md setup` again to download one.")
 
 
 def serve() -> int:
@@ -168,11 +286,115 @@ def serve() -> int:
     os.execv(exe, cmd)
 
 
+def selftest(server: str = DEFAULT_SERVER) -> int:
+    """Convert the bundled sample PDF and check the result, so an installation can be verified in a minute."""
+    import tempfile
+    sample = Path(__file__).with_name("data") / "sample.pdf"
+    if not sample.is_file():
+        sys.exit("error: the bundled sample.pdf is missing; reinstall pdf2md-local.")
+    require_ready()
+    serve = f"{sys.executable} -m pdf2md_local serve"
+    with tempfile.TemporaryDirectory(prefix="pdf2md-selftest-") as tmp:
+        cmd = [sys.executable, "-m", "pdf2md_local", str(sample), "--split-chapters", "--flavor", "plain",
+               "--no-cache", "--no-backup", "-o", tmp, "--paddle-server", server, "--serve-command", serve]
+        print("converting the bundled 2-page sample (about 10-30 seconds) ...", flush=True)
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            print((r.stdout + r.stderr)[-1500:])
+            print("FAILED: the conversion did not finish.")
+            return 1
+        folder = Path(tmp) / "sample"
+        notes = {p.name: p.read_text(encoding="utf-8") for p in folder.glob("*.md")}
+        text = "\n".join(notes.values())
+        checks = [
+            ("two chapter notes and an index", len(notes) == 3 and "00 Index.md" in notes),
+            ("chapter titles found", "Calculus essentials" in text and "Linear algebra" in text),
+            ("display equations as $$ blocks", text.count("$$") >= 4),
+            ("a Gaussian-integral equation", "\\sqrt{\\pi}" in text.replace(" ", "")),
+            ("a Markdown table", "| Function |" in text and "| --- |" in text),
+            ("an image saved for the figure", any((folder / "assets").glob("*.*"))),
+            ("standard links (no wikilinks)", "[[" not in text),
+        ]
+    for name, ok in checks:
+        print(f"{'ok     ' if ok else 'FAILED '} {name}")
+    good = all(ok for _, ok in checks)
+    print("self-test passed" if good else "self-test finished with differences; OCR output can vary, "
+          "compare with examples/expected/ in the repository before reporting a problem")
+    return 0 if good else 1
+
+
+DEFAULT_SEC_PER_PAGE = 3.4      # measured on a 16 GB GPU over two whole books; replaced by your own runs
+STARTUP_SECONDS = 15
+
+
+def rate_file() -> Path:
+    return data_dir() / "rate.json"
+
+
+def read_rate() -> tuple[float, bool]:
+    """Seconds per page: your own smoothed measurement if there is one, else the default."""
+    try:
+        v = float(json.loads(rate_file().read_text())["sec_per_page"])
+        if 0.05 < v < 600:
+            return v, True
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return DEFAULT_SEC_PER_PAGE, False
+
+
+def record_rate(pages: int, seconds: float) -> None:
+    """Remember how fast this machine converts (only for runs long enough to be meaningful)."""
+    if pages < 20 or seconds <= 0:
+        return
+    new = seconds / pages
+    old, measured = read_rate()
+    try:
+        rate_file().parent.mkdir(parents=True, exist_ok=True)
+        rate_file().write_text(json.dumps({"sec_per_page": round(0.5 * old + 0.5 * new if measured else new, 3)}))
+    except OSError:
+        pass
+
+
+def info(argv: list[str]) -> int:
+    """Pages and an estimated time for PDFs, before converting them."""
+    from pdf2md_local import convert
+    ap = argparse.ArgumentParser(prog="pdf2md info")
+    ap.add_argument("pdf", type=Path, nargs="+")
+    ap.add_argument("--pages", help="only these pages, e.g. 10-40 (same as pdf2md --pages)")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    rate, measured = read_rate()
+    files = []
+    for pdf in a.pdf:
+        total = convert.page_count(pdf) if pdf.is_file() else None
+        n = None
+        if total:
+            first, last = convert.parse_pages(a.pages, total) if len(a.pdf) == 1 else (1, total)
+            n = (last or total) - first + 1
+        files.append({"name": pdf.name, "pages": n, "seconds": None if n is None else round(n * rate + STARTUP_SECONDS)})
+    known = [f for f in files if f["pages"]]
+    out = {"files": files, "pages": sum(f["pages"] for f in known), "seconds": sum(f["seconds"] for f in known),
+           "unknown": len(files) - len(known), "sec_per_page": rate, "measured": measured}
+    if a.json:
+        print(json.dumps(out))
+    else:
+        for f in files:
+            print(f"{f['name']}: {f['pages'] or '?'} pages, about {round((f['seconds'] or 0) / 60, 1)} min")
+        print(f"total: {out['pages']} pages, about {round(out['seconds'] / 60, 1)} min "
+              f"({'your measured speed' if measured else 'default speed'}: {rate:.1f} s/page)")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="pdf2md " + argv[0])
     if argv[0] == "serve":
         ap.parse_args(argv[1:])
         return serve()
+    if argv[0] == "info":
+        return info(argv[1:])
+    if argv[0] == "selftest":
+        ap.add_argument("--server", default=os.environ.get("PDF2MD_PADDLE_SERVER", DEFAULT_SERVER))
+        return selftest(ap.parse_args(argv[1:]).server)
     if argv[0] == "check":
         ap.add_argument("--server", default=os.environ.get("PDF2MD_PADDLE_SERVER", DEFAULT_SERVER))
         ap.add_argument("--json", action="store_true", help="machine-readable output (used by the Obsidian plugin)")
@@ -187,6 +409,9 @@ def main(argv: list[str]) -> int:
                 print(f"{mark}  {c['detail']}" + ("" if c["ok"] or not c["fix"] else f"\n         -> {c['fix']}"))
             print("ready to convert" if ready else f"not ready. {SETUP_HINT}")
         return 0 if ready else 1
-    ap.parse_args(argv[1:])
-    setup()
+    ap.add_argument("--llama", choices=("auto", "cuda", "vulkan", "cpu", "skip"), default="auto",
+                    help="which prebuilt llama.cpp to download if llama-server is not found (default: auto-detect; skip = never)")
+    ap.add_argument("--llama-only", action="store_true", help="only install llama-server")
+    a = ap.parse_args(argv[1:])
+    setup(a.llama, a.llama_only)
     return 0

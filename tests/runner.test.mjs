@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
 	DEFAULT_SETTINGS, splitArgs, buildArgs, parseLine, statusText, augmentedPath, toVaultPath, noteToOpen,
 	batchLabel, validPages, toolEnv, quoteArg, migrateSettings, parseCheck, setupProblem,
+	parseEstimate, buildInfoArgs, estimateText, needsConfirmation,
 	initialState, reduce, fractionOverall, etaSeconds, formatDuration, etaLabel, statusBarText,
 } from "../.test-build/runner.mjs";
 
@@ -221,4 +222,25 @@ test("formatDuration and the label read naturally", () => {
 	assert.equal(formatDuration(5400), "1 h 30 min");
 	assert.equal(formatDuration(7230), "2 h 1 min");
 	assert.equal(formatDuration(7199), "2 h");
+});
+
+test("estimate: parsing, text and when to ask", () => {
+	const raw = { files: [{ name: "a.pdf", pages: 541, seconds: 1854 }], pages: 541, seconds: 1854, unknown: 0, sec_per_page: 3.4, measured: false };
+	assert.equal(parseEstimate("nope"), null);
+	assert.equal(parseEstimate("{}"), null);
+	const e = parseEstimate(JSON.stringify(raw));
+	assert.equal(e.pages, 541);
+	assert.equal(estimateText(e, false), "541 pages: about 31 min (a typical GPU speed). The model server will be started first.");
+	assert.match(estimateText({ ...e, measured: true, pages: 1, seconds: 20 }, true), /^1 page: about 20 s \(from your recent conversions\)\. The model server is already running\.$/);
+	assert.match(estimateText({ ...e, unknown: 2 }, true), /plus 2 PDFs of unknown length/);
+	assert.ok(needsConfirmation(e, 5));
+	assert.ok(!needsConfirmation({ ...e, seconds: 120 }, 5));
+	assert.ok(!needsConfirmation(e, 0), "0 means never ask");
+	assert.equal(DEFAULT_SETTINGS.confirmOverMinutes, 5);
+});
+
+test("buildInfoArgs passes the page range only for a single PDF", () => {
+	assert.deepEqual(buildInfoArgs(["/a.pdf"], " 10-40 "), ["info", "--json", "/a.pdf", "--pages", "10-40"]);
+	assert.deepEqual(buildInfoArgs(["/a.pdf", "/b.pdf"], "10-40"), ["info", "--json", "/a.pdf", "/b.pdf"]);
+	assert.deepEqual(buildInfoArgs(["/a.pdf"]), ["info", "--json", "/a.pdf"]);
 });

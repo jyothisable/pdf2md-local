@@ -17,6 +17,11 @@ import * as os from "os";
 import * as path from "path";
 import {
 	DEFAULT_SETTINGS,
+	SetupCheck,
+	buildInfoArgs,
+	estimateText,
+	needsConfirmation,
+	parseEstimate,
 	PageLinks,
 	ProgressState,
 	Settings,
@@ -186,38 +191,47 @@ export default class Pdf2MdPlugin extends Plugin {
 		return toolEnv(process.env, os.homedir(), path.delimiter);
 	}
 
+	/** Run a `pdf2md` subcommand and return its standard output, or null if the program could not be run. */
+	private runTool(args: string[], timeout = 60000): Promise<string | null> {
+		return new Promise((resolve) =>
+			execFile(this.settings.pdf2mdPath, args, { env: this.env(), timeout }, (err, stdout) =>
+				resolve(err && !stdout ? null : String(stdout))),
+		);
+	}
+
 	/**
 	 * Ask the installed `pdf2md` whether it is ready. The plugin never installs or downloads anything: when something
-	 * is missing it only says which terminal command to run.
+	 * is missing it only shows which terminal command to run, with a copy button.
 	 */
-	async checkSetup(verbose = false): Promise<boolean> {
+	async checkSetup(verbose = false): Promise<{ ready: boolean; serverUp: boolean } | null> {
 		const s = this.settings;
-		const out = await new Promise<{ err: Error | null; stdout: string }>((resolve) =>
-			execFile(s.pdf2mdPath, ["check", "--json", "--server", s.paddleServer], { env: this.env(), timeout: 60000 },
-				(err, stdout) => resolve({ err, stdout: String(stdout) })),
-		);
-		const check = parseCheck(out.stdout);
+		const out = await this.runTool(["check", "--json", "--server", s.paddleServer]);
+		const check = out === null ? null : parseCheck(out);
 		if (!check) {
-			new Notice(
-				`PDF to Markdown: could not run "${s.pdf2mdPath}". Install it in a terminal (uv tool install pdf2md-local, then ` +
-					`pdf2md setup), or set its full path in the plugin settings.`,
-				15000,
-			);
-			return false;
+			new SetupModal(this.app, s.pdf2mdPath, null, "Could not run the pdf2md command.").open();
+			return null;
 		}
+		const serverUp = check.checks.find((c) => c.id === "server")?.ok ?? false;
 		const problem = setupProblem(check, s.serveCommand.trim() !== "");
 		if (problem) {
-			new Notice(`PDF to Markdown: ${problem}`, 15000);
-			return false;
+			new SetupModal(this.app, s.pdf2mdPath, check.checks, problem).open();
+			return null;
 		}
-		if (verbose) {
-			const server = check.checks.find((c) => c.id === "server");
-			new Notice(
-				"PDF to Markdown: ready." + (server?.ok ? "" : " The model server is not running; it is started for each conversion."),
-				8000,
-			);
+		if (verbose) new SetupModal(this.app, s.pdf2mdPath, check.checks, null).open();
+		return { ready: true, serverUp };
+	}
+
+	/** Pages and an estimated time; asks first when the job is long. Returns false if the user backs out. */
+	private async confirmEstimate(files: TFile[], base: string, pages: string | undefined, serverUp: boolean): Promise<boolean> {
+		const out = await this.runTool(buildInfoArgs(files.map((f) => path.join(base, f.path)), pages));
+		const est = out === null ? null : parseEstimate(out);
+		if (!est) return true;                       // an estimate is a convenience: never block a conversion on it
+		const text = estimateText(est, serverUp);
+		if (!needsConfirmation(est, this.settings.confirmOverMinutes)) {
+			new Notice(`PDF to Markdown: ${text}`, 8000);
+			return true;
 		}
-		return true;
+		return new Promise<boolean>((resolve) => new ConfirmModal(this.app, files.length, text, resolve).open());
 	}
 
 	// ---- starting a conversion ---------------------------------------------------------------
@@ -242,7 +256,9 @@ export default class Pdf2MdPlugin extends Plugin {
 			return;
 		}
 		if (!files.length) return;
-		if (!(await this.checkSetup())) return;
+		const ready = await this.checkSetup();
+		if (!ready) return;
+		if (!(await this.confirmEstimate(files, base, files.length === 1 ? pages : undefined, ready.serverUp))) return;
 
 		let outAbs: string | undefined;
 		const raw = this.settings.outputFolder.trim();
@@ -397,6 +413,76 @@ export default class Pdf2MdPlugin extends Plugin {
 			job.proc.kill();
 		}
 		if (!quiet) new Notice("PDF to Markdown: cancelling…");
+	}
+}
+
+/** The result of `pdf2md check`: what is ready, and for anything missing the command to run, with a copy button. */
+class SetupModal extends Modal {
+	constructor(app: App, private tool: string, private checks: SetupCheck[] | null, private problem: string | null) {
+		super(app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("pdf2md setup");
+		const el = this.contentEl;
+		if (this.problem) el.createEl("p", { cls: "pdf2md-problem", text: this.problem });
+		else el.createEl("p", { text: "Everything required is ready." });
+		if (this.checks === null) {
+			el.createEl("p", { text: `Install the tool once in a terminal (then press Check again). The command "${this.tool}" must be on your path, or set its full path in the plugin settings.` });
+			this.command("uv tool install git+https://github.com/jyothisable/pdf2md-local");
+			this.command("pdf2md setup");
+			return;
+		}
+		for (const c of this.checks) {
+			const row = el.createDiv({ cls: "pdf2md-check" });
+			row.createSpan({ cls: c.ok ? "pdf2md-ok" : c.required ? "pdf2md-missing" : "pdf2md-optional", text: c.ok ? "Ready" : c.required ? "Missing" : "Not set" });
+			row.createSpan({ text: ` ${c.detail}` });
+			if (!c.ok && c.fix) this.command(c.fix);
+		}
+	}
+
+	private command(text: string) {
+		const row = this.contentEl.createDiv({ cls: "pdf2md-command" });
+		row.createEl("code", { text });
+		const copy = row.createEl("button", { text: "Copy" });
+		copy.addEventListener("click", () => {
+			void navigator.clipboard.writeText(text).then(() => {
+				copy.setText("Copied");
+				window.setTimeout(() => copy.setText("Copy"), 1500);
+			});
+		});
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+/** Shown before a long conversion: pages, estimated time and whether the model server is running. */
+class ConfirmModal extends Modal {
+	private answered = false;
+
+	constructor(app: App, private count: number, private text: string, private done: (go: boolean) => void) {
+		super(app);
+	}
+
+	onOpen() {
+		this.titleEl.setText(this.count === 1 ? "Convert this PDF?" : `Convert ${this.count} PDFs?`);
+		this.contentEl.createEl("p", { text: this.text });
+		new Setting(this.contentEl)
+			.addButton((b) => b.setButtonText("Convert").setCta().onClick(() => this.answer(true)))
+			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.answer(false)));
+	}
+
+	private answer(go: boolean) {
+		this.answered = true;
+		this.close();
+		this.done(go);
+	}
+
+	onClose() {
+		this.contentEl.empty();
+		if (!this.answered) this.done(false);
 	}
 }
 
@@ -695,6 +781,8 @@ class Pdf2MdSettingTab extends PluginSettingTab {
 			.addToggle((t) => t.setValue(s.keepPageMarkers).onChange(async (v) => { s.keepPageMarkers = v; await save(); }));
 		new Setting(containerEl).setName("Show a progress window").setDesc("Opens when a conversion starts, with a progress bar and the time left. Close it to keep working: the conversion continues, and clicking the status bar reopens it.")
 			.addToggle((t) => t.setValue(s.progressWindow).onChange(async (v) => { s.progressWindow = v; await save(); }));
+		new Setting(containerEl).setName("Ask before long conversions").setDesc("Show the page count and estimated time and ask to confirm when a conversion is expected to take at least this many minutes. 0 = never ask (a short notice is still shown).")
+			.addText((t) => t.setValue(String(s.confirmOverMinutes)).onChange(async (v) => { const n = Number(v); s.confirmOverMinutes = Number.isFinite(n) && n >= 0 ? n : DEFAULT_SETTINGS.confirmOverMinutes; await save(); }));
 		new Setting(containerEl).setName("Ask which pages to convert").setDesc("Prompt for a page range before every single-PDF conversion. The command \"Convert PDF pages…\" always asks.")
 			.addToggle((t) => t.setValue(s.askForPages).onChange(async (v) => { s.askForPages = v; await save(); }));
 

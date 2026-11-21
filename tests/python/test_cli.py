@@ -268,6 +268,91 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class InfoAndRateTests(unittest.TestCase):
+    def env(self, d):
+        return mock.patch.dict("os.environ", {"PDF2MD_HOME": d, "MODEL_DIR": d})
+
+    def test_rate_defaults_then_learns_and_ignores_short_runs(self):
+        with tempfile.TemporaryDirectory() as d, self.env(d):
+            self.assertEqual(backend.read_rate(), (backend.DEFAULT_SEC_PER_PAGE, False))
+            backend.record_rate(5, 100)                      # too short to mean anything
+            self.assertFalse(backend.read_rate()[1])
+            backend.record_rate(100, 400)                    # 4 s/page, the first measurement
+            self.assertEqual(backend.read_rate(), (4.0, True))
+            backend.record_rate(100, 200)                    # 2 s/page is averaged in
+            self.assertEqual(backend.read_rate(), (3.0, True))
+            Path(backend.rate_file()).write_text("{broken")
+            self.assertFalse(backend.read_rate()[1])
+
+    def test_info_estimates_from_the_page_count(self):
+        with tempfile.TemporaryDirectory() as d, self.env(d):
+            pdf = make_pdf(d, "a.pdf")
+            buf = io.StringIO()
+            with mock.patch.object(m, "page_count", lambda p: 200), contextlib.redirect_stdout(buf):
+                backend.main(["info", "--json", pdf, "--pages", "11-30"])
+            data = __import__("json").loads(buf.getvalue())
+            self.assertEqual(data["pages"], 20)
+            self.assertEqual(data["seconds"], round(20 * backend.DEFAULT_SEC_PER_PAGE + backend.STARTUP_SECONDS))
+            buf = io.StringIO()
+            with mock.patch.object(m, "page_count", lambda p: None), contextlib.redirect_stdout(buf):
+                backend.main(["info", "--json", pdf])
+            data = __import__("json").loads(buf.getvalue())
+            self.assertEqual((data["pages"], data["unknown"]), (0, 1))
+
+    def test_conversion_records_its_speed(self):
+        with tempfile.TemporaryDirectory() as d, self.env(d):
+            with mock.patch.object(backend, "record_rate") as rec:
+                Env(d, pages=40).run([make_pdf(d)])
+            self.assertEqual(rec.call_args[0][0], 40)             # pages converted in this run
+            with mock.patch.object(backend, "record_rate") as rec:
+                Env(d, pages=40).run([make_pdf(d, "b.pdf"), "--pages", "1-5"])
+            self.assertEqual(rec.call_args[0][0], 5)
+
+
+class LlamaInstallTests(unittest.TestCase):
+    NAMES = ["llama-b1-bin-ubuntu-x64.tar.gz", "llama-b1-bin-ubuntu-vulkan-x64.tar.gz",
+             "llama-b1-bin-ubuntu-cuda-12.8-x64.tar.gz", "llama-b1-bin-ubuntu-cuda-13.5-x64.tar.gz",
+             "cudart-llama-b1-bin-ubuntu-cuda-12.8-x64.tar.gz", "cudart-llama-b1-bin-ubuntu-cuda-13.5-x64.tar.gz",
+             "llama-b1-bin-macos-arm64.tar.gz", "llama-b1-bin-macos-x64.tar.gz",
+             "llama-b1-bin-win-cuda-12.4-x64.zip", "cudart-llama-bin-win-cuda-12.4-x64.zip",
+             "llama-b1-bin-win-vulkan-x64.zip", "llama-b1-bin-win-cpu-x64.zip"]
+
+    def test_asset_choice(self):
+        pick = lambda *a, **k: backend.pick_llama_assets(self.NAMES, *a, **k)
+        self.assertEqual(pick("Linux", "x86_64", (13, 6)), ["llama-b1-bin-ubuntu-cuda-13.5-x64.tar.gz", "cudart-llama-b1-bin-ubuntu-cuda-13.5-x64.tar.gz"])
+        self.assertEqual(pick("Linux", "x86_64", (12, 9))[0], "llama-b1-bin-ubuntu-cuda-12.8-x64.tar.gz")   # never newer than the driver
+        self.assertIsNone(pick("Linux", "x86_64", (11, 8), "cuda"))
+        self.assertEqual(pick("Linux", "x86_64", None, "auto", True), ["llama-b1-bin-ubuntu-vulkan-x64.tar.gz"])
+        self.assertEqual(pick("Linux", "x86_64", None), ["llama-b1-bin-ubuntu-x64.tar.gz"])
+        self.assertEqual(pick("Linux", "x86_64", (13, 5), "cpu"), ["llama-b1-bin-ubuntu-x64.tar.gz"])
+        self.assertEqual(pick("Darwin", "arm64", None), ["llama-b1-bin-macos-arm64.tar.gz"])
+        self.assertEqual(pick("Darwin", "x86_64", None), ["llama-b1-bin-macos-x64.tar.gz"])
+        self.assertEqual(pick("Windows", "AMD64", (12, 6)), ["llama-b1-bin-win-cuda-12.4-x64.zip", "cudart-llama-bin-win-cuda-12.4-x64.zip"])
+        self.assertEqual(pick("Windows", "AMD64", None, "auto", True), ["llama-b1-bin-win-vulkan-x64.zip"])
+        self.assertIsNone(pick("Linux", "riscv64", None))
+
+    def test_extract_refuses_paths_that_escape(self):
+        import tarfile
+        with tempfile.TemporaryDirectory() as d:
+            evil = Path(d) / "evil.tar.gz"
+            src = Path(d) / "x.txt"
+            src.write_text("x")
+            with tarfile.open(evil, "w:gz") as t:
+                t.add(src, arcname="../escaped.txt")
+            with self.assertRaises(SystemExit):
+                backend._safe_extract(evil, Path(d) / "out")
+            self.assertFalse((Path(d) / "escaped.txt").exists())
+
+    def test_downloaded_server_is_found(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict("os.environ", {"PDF2MD_HOME": d, "LLAMA_SERVER": "/nonexistent"}), \
+             mock.patch("shutil.which", lambda c: None):
+            self.assertIsNone(backend.llama_server())
+            exe = Path(d) / "llama.cpp" / "b1" / "llama-b1" / "llama-server"
+            exe.parent.mkdir(parents=True)
+            exe.write_text("")
+            self.assertEqual(backend.llama_server(), str(exe))
+
+
 class StripScriptTests(unittest.TestCase):
     def test_script_removes_only_marker_lines_and_backs_up(self):
         import subprocess

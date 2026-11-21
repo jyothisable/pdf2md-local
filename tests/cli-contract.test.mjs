@@ -35,7 +35,7 @@ test("the tool takes several PDFs", () => {
 });
 
 test("setup, check and serve are subcommands that print their own help", () => {
-	for (const sub of ["setup", "check", "serve"]) {
+	for (const sub of ["setup", "check", "serve", "selftest", "info"]) {
 		const out = execFileSync(process.env.PYTHON ?? "python3", ["-m", "pdf2md_local", sub, "--help"],
 			{ encoding: "utf8", env: { ...process.env, PYTHONPATH: process.cwd() } });
 		assert.match(out, /usage: pdf2md/);
