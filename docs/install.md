@@ -7,7 +7,7 @@ Everything that installs or downloads is done by **you, in a terminal**. The Obs
 1. **uv** — <https://docs.astral.sh/uv/getting-started/installation/>
 2. The tool, its backend and llama.cpp:
    ```bash
-   uv tool install git+https://github.com/jyothisable/pdf2md-local@0.6.0
+   uv tool install git+https://github.com/jyothisable/pdf2md-local@0.7.0
    pdf2md setup       # worker environment, 1.8 GB model, and a prebuilt llama-server unless one is already on PATH
    pdf2md selftest    # converts a bundled sample and checks it
    ```

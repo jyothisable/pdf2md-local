@@ -44,7 +44,7 @@ llama.cpp: build it yourself. Details, other platforms, update, uninstall and tr
 [docs/install.md](docs/install.md).
 
 ```bash
-uv tool install git+https://github.com/jyothisable/pdf2md-local@0.6.0   # the pdf2md command (a fixed release)
+uv tool install git+https://github.com/jyothisable/pdf2md-local@0.7.0   # the pdf2md command (a fixed release)
 pdf2md setup       # once: worker environment, model, and a prebuilt llama.cpp (llama-server) if you have none
 pdf2md selftest    # converts a bundled 2-page sample and checks the result
 ```
