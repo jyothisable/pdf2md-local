@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-	DEFAULT_SETTINGS, splitArgs, buildArgs, parseLine, statusText, augmentedPath, toVaultPath, noteToOpen, clampInt,
-	apiBase, batchLabel, validPages, toolEnv,
+	DEFAULT_SETTINGS, splitArgs, buildArgs, parseLine, statusText, augmentedPath, toVaultPath, noteToOpen,
+	batchLabel, validPages, toolEnv, quoteArg, migrateSettings, parseCheck, setupProblem,
 	initialState, reduce, fractionOverall, etaSeconds, formatDuration, etaLabel, statusBarText,
 } from "../.test-build/runner.mjs";
 
@@ -13,48 +13,85 @@ test("splitArgs honours quotes and empty input", () => {
 	assert.deepEqual(splitArgs('--x ""'), ["--x", ""]);
 });
 
-test("buildArgs: defaults run the bundled script with the Ollama options", () => {
-	const a = buildArgs("/s/pdf_to_md.py", "/v/a.pdf", DEFAULT_SETTINGS);
-	assert.deepEqual(a.slice(0, 5), ["run", "--python", "3.12", "/s/pdf_to_md.py", "/v/a.pdf"]);
-	for (const pair of [["--model", "gemma4:12b"], ["--jobs", "3"], ["--clean", "auto"], ["--inline-math", "auto"], ["--pages-per-batch", "40"]]) {
-		assert.equal(a[a.indexOf(pair[0]) + 1], pair[1], pair[0]);
+test("buildArgs: defaults call pdf2md with the Obsidian flavour and the Paddle server", () => {
+	const a = buildArgs("/v/a.pdf", DEFAULT_SETTINGS);
+	assert.equal(a[0], "/v/a.pdf");
+	assert.equal(a[a.indexOf("--flavor") + 1], "obsidian");
+	assert.equal(a[a.indexOf("--paddle-server") + 1], "http://127.0.0.1:8111/v1");
+	assert.equal(a[a.indexOf("--paddle-scale") + 1], "2.5");
+	assert.equal(a[a.indexOf("--serve-command") + 1], "pdf2md serve");
+	assert.equal(a[a.indexOf("--page-links") + 1], "auto");
+	for (const gone of ["--engine", "--model", "--host", "--jobs", "--api", "--clean", "--no-llm", "--split-chapters", "-o", "--pages"]) {
+		assert.ok(!a.includes(gone), gone);
 	}
-	assert.ok(!a.includes("--no-llm") && !a.includes("--split-chapters") && !a.includes("-o") && !a.includes("--vision-model"));
 });
 
-test("buildArgs: toggles, output folder, vision model, pages and extra args", () => {
-	const s = { ...DEFAULT_SETTINGS, splitChapters: true, visionModel: " qwen3-vl:8b ", extraArgs: "--no-ocr --timeout 900" };
-	const a = buildArgs("/s.py", "/v/a.pdf", s, "/v/out", "10-40");
+test("buildArgs: toggles, output folder, scale, server, pages and extra args", () => {
+	const s = { ...DEFAULT_SETTINGS, splitChapters: true, paddleScale: 9, paddleServer: " http://h:1/v1 ", pageLinks: "off",
+		serveCommand: " /x/serve.sh ", pdf2mdPath: "/opt/my tools/pdf2md", extraArgs: "--no-cache --serve-wait 300" };
+	const a = buildArgs("/v/a.pdf", s, "/v/out", "10-40");
 	assert.ok(a.includes("--split-chapters"));
 	assert.equal(a[a.indexOf("-o") + 1], "/v/out");
-	assert.equal(a[a.indexOf("--vision-model") + 1], "qwen3-vl:8b");
 	assert.equal(a[a.indexOf("--pages") + 1], "10-40");
-	assert.deepEqual(a.slice(-3), ["--no-ocr", "--timeout", "900"]);
-	const noVision = buildArgs("/s.py", "/v/a.pdf", { ...s, useVision: false });
-	assert.ok(noVision.includes("--no-vision") && !noVision.includes("--vision-model"));
-	const noLlm = buildArgs("/s.py", "/v/a.pdf", { ...s, useLlm: false });
-	assert.ok(noLlm.includes("--no-llm") && !noLlm.includes("--model") && !noLlm.includes("--jobs"));
+	assert.equal(a[a.indexOf("--paddle-scale") + 1], "4");               // clamped
+	assert.equal(a[a.indexOf("--paddle-server") + 1], "http://h:1/v1");
+	assert.equal(a[a.indexOf("--serve-command") + 1], "/x/serve.sh");
+	assert.equal(a[a.indexOf("--page-links") + 1], "off");
+	assert.deepEqual(a.slice(-3), ["--no-cache", "--serve-wait", "300"]);
+	const bare = buildArgs("/v/a.pdf", { ...DEFAULT_SETTINGS, paddleServer: " ", pdf2mdPath: "/opt/my tools/pdf2md" });
+	assert.equal(bare[bare.indexOf("--paddle-server") + 1], "http://127.0.0.1:8111/v1");
+	assert.equal(bare[bare.indexOf("--serve-command") + 1], '"/opt/my tools/pdf2md" serve');   // a path with spaces stays one word
 });
 
-test("clampInt keeps numbers sane", () => {
-	assert.equal(clampInt(99, 1, 16), 16);
-	assert.equal(clampInt(0, 1, 16), 1);
-	assert.equal(clampInt(2.6, 1, 16), 3);
-	assert.equal(clampInt(NaN, 1, 16), 1);
-	const a = buildArgs("/s.py", "/p.pdf", { ...DEFAULT_SETTINGS, jobs: 500 });
-	assert.equal(a[a.indexOf("--jobs") + 1], "16");
+test("quoteArg", () => {
+	assert.equal(quoteArg("pdf2md"), "pdf2md");
+	assert.equal(quoteArg("/a b/c"), '"/a b/c"');
+	assert.equal(quoteArg('a"b'), '"a\\"b"');
+});
+
+test("buildArgs: several PDFs go first, in order", () => {
+	const a = buildArgs(["/v/a.pdf", "/v/b.pdf", "/v/c.pdf"], DEFAULT_SETTINGS, "/v/out");
+	assert.deepEqual(a.slice(0, 5), ["/v/a.pdf", "/v/b.pdf", "/v/c.pdf", "-o", "/v/out"]);
+});
+
+test("migrateSettings keeps known values and drops everything else", () => {
+	const m = migrateSettings({ engine: "docling", textModel: "gemma4:12b", apiKey: "SECRET", paddleScale: 4, splitChapters: true,
+		outputFolder: "Imports", paddleServer: 7, pageLinks: "on" });
+	assert.equal(m.paddleScale, 4);
+	assert.equal(m.splitChapters, true);
+	assert.equal(m.outputFolder, "Imports");
+	assert.equal(m.pageLinks, "on");
+	assert.equal(m.paddleServer, DEFAULT_SETTINGS.paddleServer);          // wrong type: default
+	assert.deepEqual(Object.keys(m).sort(), Object.keys(DEFAULT_SETTINGS).sort());
+	assert.equal(JSON.stringify(m).includes("SECRET"), false);
+	assert.deepEqual(migrateSettings(null), DEFAULT_SETTINGS);
+});
+
+test("setup check: parsing and what the user is told", () => {
+	const ok = { ready: true, checks: [
+		{ id: "worker", ok: true, required: true, detail: "worker", fix: "pdf2md setup" },
+		{ id: "llama-server", ok: false, required: false, detail: "llama", fix: "install llama.cpp" },
+		{ id: "server", ok: false, required: false, detail: "server", fix: "pdf2md serve" } ] };
+	assert.equal(parseCheck("not json"), null);
+	assert.equal(parseCheck('{"ready": 1}'), null);
+	assert.deepEqual(parseCheck(JSON.stringify(ok)), ok);
+	assert.match(setupProblem(ok, false), /llama-server was not found/);       // nothing can start a server
+	assert.equal(setupProblem(ok, true), null);                                // a start command is configured
+	const down = { ready: false, checks: [{ id: "worker", ok: false, required: true, detail: "worker environment", fix: "pdf2md setup" }] };
+	assert.match(setupProblem(down, true), /pdf2md setup/);
+	const serving = { ready: true, checks: [{ id: "server", ok: true, required: false, detail: "s", fix: "" }] };
+	assert.equal(setupProblem(serving, false), null);
 });
 
 test("parseLine understands the tool's real output", () => {
 	assert.deepEqual(parseLine("  slice 8/14 (pages 281-320): 73 equation(s), 38/43 inline [1620s, ETA ~20 min]"),
 		{ kind: "slice", n: 8, total: 14, etaMin: 20 });
 	assert.deepEqual(parseLine("  slice 14/14 (pages 521-552): 51 equation(s) [2718s]"), { kind: "slice", n: 14, total: 14, etaMin: undefined });
-	assert.deepEqual(parseLine("  cleaned 3/7 chunk(s) submitted"), { kind: "cleaning", done: 3, total: 7 });
 	assert.deepEqual(parseLine("[4/4] wrote /v/Books/My Book.md (2719s)"), { kind: "wrote", path: "/v/Books/My Book.md", split: false });
 	assert.deepEqual(parseLine("[4/4] wrote 16 notes + index to /v/Books/My Book (2862s)"),
 		{ kind: "wrote", path: "/v/Books/My Book", split: true, notes: 16 });
-	assert.deepEqual(parseLine("[2/4] gemma4:12b: 7 chunk(s) to clean"), { kind: "stage", stage: 2, text: "gemma4:12b: 7 chunk(s) to clean" });
-	assert.equal(parseLine("error: cannot reach Ollama at http://x").kind, "error");
+	assert.deepEqual(parseLine("[3/4] math check: 0 problem(s)"), { kind: "stage", stage: 3, text: "math check: 0 problem(s)" });
+	assert.equal(parseLine("error: missing worker environment. Run `pdf2md setup` once").kind, "error");
 	assert.equal(parseLine("some warning").kind, "other");
 	assert.equal(parseLine("").kind, "other");
 });
@@ -62,11 +99,10 @@ test("parseLine understands the tool's real output", () => {
 test("statusText", () => {
 	assert.equal(statusText({ kind: "slice", n: 2, total: 14, etaMin: 30 }), "PDF→MD: slice 2/14 · ~30 min left");
 	assert.equal(statusText({ kind: "slice", n: 14, total: 14 }), "PDF→MD: slice 14/14");
-	assert.equal(statusText({ kind: "cleaning", done: 1, total: 2 }), "PDF→MD: cleaning 1/2");
 	assert.equal(statusText({ kind: "other" }), null);
 });
 
-test("augmentedPath adds the usual uv locations once", () => {
+test("augmentedPath adds the usual tool locations once", () => {
 	const p = augmentedPath({ PATH: "/usr/bin:/home/u/.local/bin" }, "/home/u");
 	const parts = p.split(":");
 	assert.equal(parts.filter((x) => x === "/home/u/.local/bin").length, 1);
@@ -84,51 +120,6 @@ test("toVaultPath and noteToOpen", () => {
 	assert.equal(noteToOpen({ path: "Books/a.md", split: false }), "Books/a.md");
 });
 
-test("buildArgs: several PDFs go before the options, in order", () => {
-	const a = buildArgs("/s.py", ["/v/a.pdf", "/v/b.pdf", "/v/c.pdf"], DEFAULT_SETTINGS, "/v/out");
-	assert.deepEqual(a.slice(3, 8), ["/s.py", "/v/a.pdf", "/v/b.pdf", "/v/c.pdf", "-o"]);
-	assert.equal(a[a.indexOf("-o") + 1], "/v/out");
-});
-
-test("buildArgs: an OpenAI-compatible server and an API key kept off the command line", () => {
-	const s = { ...DEFAULT_SETTINGS, api: "openai", ollamaHost: "http://localhost:8080", visionModel: "gemma", apiKey: "SECRET-KEY" };
-	const a = buildArgs("/s.py", "/v/a.pdf", s);
-	assert.equal(a[a.indexOf("--api") + 1], "openai");
-	assert.equal(a[a.indexOf("--host") + 1], "http://localhost:8080");
-	assert.ok(!a.join(" ").includes("SECRET-KEY"), "the API key must never be on the command line");
-});
-
-test("buildArgs: the PaddleOCR-VL engine passes the server and nothing about models", () => {
-	const s = { ...DEFAULT_SETTINGS, engine: "paddleocr-vl", paddleServer: " http://127.0.0.1:8111/v1 ", serveCommand: " /x/serve.sh ", splitChapters: true };
-	const a = buildArgs("/s.py", "/v/a.pdf", s, undefined, "5-9");
-	assert.equal(a[a.indexOf("--engine") + 1], "paddleocr-vl");
-	assert.equal(a[a.indexOf("--paddle-server") + 1], "http://127.0.0.1:8111/v1");
-	assert.equal(a[a.indexOf("--paddle-scale") + 1], "2.5");
-	assert.equal(a[a.indexOf("--serve-command") + 1], "/x/serve.sh");
-	assert.ok(a.includes("--split-chapters") && a.includes("--page-links"));
-	assert.equal(a[a.indexOf("--pages") + 1], "5-9");
-	for (const f of ["--model", "--host", "--jobs", "--api", "--clean", "--inline-math", "--vision-model", "--pages-per-batch", "--no-llm", "--no-equation-flags"]) {
-		assert.ok(!a.includes(f), `${f} makes no sense for the PaddleOCR-VL engine`);
-	}
-	const bare = buildArgs("/s.py", "/v/a.pdf", { ...DEFAULT_SETTINGS, engine: "paddleocr-vl", paddleServer: " " });
-	assert.equal(bare[bare.indexOf("--paddle-server") + 1], "http://127.0.0.1:8111/v1");   // empty falls back to the default
-	assert.ok(!bare.includes("--serve-command"));
-});
-
-test("buildArgs: separate vision server, page links and equation flags", () => {
-	const s = { ...DEFAULT_SETTINGS, visionApi: "openai", visionHost: " http://localhost:8080 ", pageLinks: "off", equationFlags: false };
-	const a = buildArgs("/s.py", "/v/a.pdf", s);
-	assert.equal(a[a.indexOf("--vision-api") + 1], "openai");
-	assert.equal(a[a.indexOf("--vision-host") + 1], "http://localhost:8080");
-	assert.equal(a[a.indexOf("--page-links") + 1], "off");
-	assert.ok(a.includes("--no-equation-flags"));
-	const d = buildArgs("/s.py", "/v/a.pdf", DEFAULT_SETTINGS);
-	assert.ok(!d.includes("--vision-api") && !d.includes("--vision-host") && !d.includes("--no-equation-flags") && !d.includes("--engine"));
-	assert.equal(d[d.indexOf("--clean") + 1], "auto");
-	const noVision = buildArgs("/s.py", "/v/a.pdf", { ...s, useVision: false });
-	assert.ok(noVision.includes("--no-vision") && !noVision.includes("--vision-model"));
-});
-
 test("parseLine and statusText understand batches", () => {
 	assert.deepEqual(parseLine("=== PDF 2/5: Some Book (2020).pdf"), { kind: "pdf", n: 2, total: 5, name: "Some Book (2020).pdf" });
 	assert.equal(statusText({ kind: "pdf", n: 2, total: 5, name: "x" }), "PDF→MD: PDF 2/5");
@@ -139,27 +130,17 @@ test("parseLine and statusText understand batches", () => {
 	assert.equal(batchLabel({ kind: "other" }), "");
 });
 
-test("apiBase mirrors the tool's rule", () => {
-	assert.equal(apiBase("http://localhost:8080"), "http://localhost:8080/v1");
-	assert.equal(apiBase(" http://localhost:8080/ "), "http://localhost:8080/v1");
-	assert.equal(apiBase("http://localhost:8080/v1/"), "http://localhost:8080/v1");
-	assert.equal(apiBase("https://openrouter.ai/api/v1"), "https://openrouter.ai/api/v1");
-	assert.equal(apiBase("not a url"), "not a url");
-});
-
 test("validPages accepts the tool's page-range syntax only", () => {
 	for (const ok of ["", "  ", "7", "10-40", " 3 - 9 "]) assert.ok(validPages(ok), ok);
 	for (const bad of ["0", "0-4", "9-3", "a", "1-", "-5", "1,2", "1-2-3"]) assert.ok(!validPages(bad), bad);
 });
 
-test("toolEnv adds PATH and the key without losing the rest", () => {
-	const e = toolEnv({ PATH: "/usr/bin", HOME: "/h", EMPTY: undefined }, "/h", " k ");
-	assert.equal(e.PDF2MD_API_KEY, "k");
+test("toolEnv extends PATH without losing the rest", () => {
+	const e = toolEnv({ PATH: "/usr/bin", HOME: "/h", EMPTY: undefined }, "/h");
 	assert.equal(e.HOME, "/h");
 	assert.ok(e.PATH.includes("/h/.local/bin") && e.PATH.startsWith("/usr/bin"));
 	assert.equal(e.PYTHONUNBUFFERED, "1");
 	assert.ok(!("EMPTY" in e));
-	assert.ok(!("PDF2MD_API_KEY" in toolEnv({}, "/h", "  ")));
 });
 
 const T0 = 1_000_000;
@@ -186,10 +167,8 @@ test("a single conversion: percentage, stage and ETA follow the pages", () => {
 	assert.equal(s.stage, "Finishing up");
 	assert.equal(etaSeconds(s, T0 + 400_000), 0);
 	assert.equal(etaLabel(s, T0 + 400_000), "almost done");
-	s = feed(s, ["[2/4] gemma: 3 chunk(s) to clean", "  cleaned 1/3 chunk(s) submitted", "[3/4] math check: 0 problem(s)"], T0 + 410_000);
+	s = feed(s, ["[3/4] math check: 0 problem(s)"], T0 + 410_000);
 	assert.equal(s.stage, "Checking the maths");
-	s = feed(s, ["  cleaned 2/3 chunk(s) submitted"], T0 + 411_000);
-	assert.equal(s.stage, "Cleaning text (2/3)");
 	s = feed(s, ["[4/4] wrote /v/a.md (400s)"], T0 + 420_000);
 	assert.equal(s.stage, "Saved");
 	assert.equal(s.wrote, 1);

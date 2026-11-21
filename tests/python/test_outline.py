@@ -1,12 +1,12 @@
 """Bookmark repair must not require an OCR model or change body content."""
 import importlib.util
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
-spec = importlib.util.spec_from_file_location('pdf2md_outline', Path(__file__).resolve().parents[1] / 'pdf_to_md.py')
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from pdf2md_local import convert as m  # noqa: E402
 
 
 class OutlineTests(unittest.TestCase):

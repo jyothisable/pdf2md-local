@@ -1,0 +1,79 @@
+{
+  "date": "2026-11-20",
+  "candidate": "paddle_source_guarded25_final_20261120_v2",
+  "engine": "paddleocr-vl-1.6",
+  "render_scale": 2.5,
+  "dataset": "seeded olmOCR-bench development subset",
+  "pdf_count": 46,
+  "test_count": 279,
+  "final_complete_runs": 1,
+  "final_scorer_invocations": 1,
+  "bootstrap_samples": 100,
+  "overall": {
+    "percent": 79.6,
+    "ci95_half_width_points": 3.6,
+    "aggregation": "mean of per-JSONL scores, official scorer"
+  },
+  "categories": {
+    "arxiv_math": {
+      "percent": 91.2,
+      "passed": 52,
+      "tests": 57
+    },
+    "old_scans_math": {
+      "percent": 61.4,
+      "passed": 35,
+      "tests": 57
+    },
+    "table_tests": {
+      "percent": 76.0,
+      "passed": 19,
+      "tests": 25
+    },
+    "old_scans": {
+      "percent": 38.7,
+      "passed": 12,
+      "tests": 31
+    },
+    "headers_footers": {
+      "percent": 100.0,
+      "passed": 14,
+      "tests": 14
+    },
+    "multi_column": {
+      "percent": 85.7,
+      "passed": 18,
+      "tests": 21
+    },
+    "long_tiny_text": {
+      "percent": 85.7,
+      "passed": 24,
+      "tests": 28
+    },
+    "baseline": {
+      "percent": 97.8,
+      "passed": 45,
+      "tests": 46
+    }
+  },
+  "mean_seconds_per_pdf": 6.481239303298619,
+  "runtime_source_sha256": {
+    "tool/pdf_to_md.py": "da893d33ed44c0dda1ced903ae61e47c6b2df25b2251843d4ddaa1f77b74bf2e",
+    "tool/paddle_worker.py": "ad9382124fadadb9f5f5169f1da3bb8197db163ad3e8bfb45791ecddeb50d9bd"
+  },
+  "caveats": [
+    "This is a small, reused development set, not an independent generalization test.",
+    "Source image fallbacks are not recognized LaTeX and must not be counted as successful math OCR.",
+    "These results cover scale 2.5 with source guards enabled; other configurations are not evaluated here.",
+    "Timing is not a controlled speed comparison."
+  ],
+  "rerun_0_4_0": {
+    "note": "Re-run with the 0.4.0 package layout (Docling engine removed, same PaddleOCR-VL pipeline): identical scores in every category.",
+    "overall_percent": 79.6,
+    "ci95_half_width_points": 3.6,
+    "tests": 279,
+    "pdfs": 46,
+    "failed_conversions": 0
+  },
+  "runtime_source_note": "runtime_source_sha256 paths refer to the pre-0.4.0 layout (tool/pdf_to_md.py, tool/paddle_worker.py) that produced the original run."
+}

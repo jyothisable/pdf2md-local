@@ -1,11 +1,7 @@
-# /// script
-# requires-python = ">=3.10,<3.14"
-# dependencies = ["paddlepaddle==3.2.1", "paddleocr[doc-parser]==3.7.0", "pypdfium2"]
-# ///
-"""PaddleOCR-VL-1.6 page worker. Run by pdf_to_md.py in its own environment; not meant to be called by hand.
+"""PaddleOCR-VL-1.6 page worker. Run by pdf2md in the environment `pdf2md setup` creates; not meant to be called by hand.
 
 PaddleOCR-VL = a layout model (PaddlePaddle, on the CPU) + a 0.9B vision-language model that reads each layout
-block. The VLM is served by llama.cpp's `llama-server` (no Ollama, no PaddlePaddle GPU build needed).
+block. The VLM is served by llama.cpp's `llama-server` (no PaddlePaddle GPU build needed).
 
   paddle_worker.py --pdf FILE --first 1 --last 40 --server http://127.0.0.1:8111/v1 --out DIR
 
@@ -20,7 +16,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-import pdf_to_md as formatting
+from pdf2md_local import convert as formatting
 
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 

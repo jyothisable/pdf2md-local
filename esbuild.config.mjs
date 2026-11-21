@@ -15,8 +15,6 @@ const context = await esbuild.context({
 	sourcemap: production ? false : "inline",
 	treeShaking: true,
 	outfile: "main.js",
-	// the Python tool and the model-server helper script are embedded as strings and written to the plugin folder at runtime
-	loader: { ".py": "text", ".sh": "text" },
 });
 
 if (production) {

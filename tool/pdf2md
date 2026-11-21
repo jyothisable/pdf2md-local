@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-# PDF -> Obsidian Markdown (Docling + Ollama). Dependencies are resolved by uv on first run.
-exec uv run --python 3.12 "$(dirname "$(readlink -f "$0")")/pdf_to_md.py" "$@"

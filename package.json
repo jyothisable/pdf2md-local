@@ -1,13 +1,13 @@
 {
-	"name": "pdf2md-obsidian",
-	"version": "0.3.0",
-	"description": "Obsidian plugin: convert PDFs to Markdown locally with Docling and Ollama.",
+	"name": "pdf2md-local",
+	"version": "0.4.0",
+	"description": "Local PDF to Markdown for maths and science, with an Obsidian plugin.",
 	"main": "main.js",
 	"scripts": {
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
 		"dev": "node esbuild.config.mjs",
 		"test": "esbuild src/runner.ts --bundle --format=esm --platform=node --outfile=.test-build/runner.mjs --log-level=warning && node --test tests/*.test.mjs",
-		"test:py": "python3 -m unittest discover -s tool/tests"
+		"test:py": "python3 -m unittest discover -s tests/python"
 	},
 	"license": "MIT",
 	"devDependencies": {

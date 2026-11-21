@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run pdf_to_md, or another PDF-to-Markdown engine, over an olmOCR-bench subset, then score and compare.
+"""Run pdf2md, or another PDF-to-Markdown engine, over an olmOCR-bench subset, then score and compare.
 
 Setup (once, outside any vault):
   uv venv --python 3.12 /tmp/olmbench/env
@@ -8,12 +8,12 @@ Setup (once, outside any vault):
 
 Usage (D = the data folder, e.g. /tmp/olmbench/data):
   run_olmocr_bench.py fetch   D                          # download a seeded subset: 8 categories, 46 PDFs
-  run_olmocr_bench.py run     D NAME [pdf2md flags...]   # convert with pdf_to_md.py
-  run_olmocr_bench.py engine  D NAME ENGINE [KEY=VAL..]  # convert with engines/ENGINE.py (docling_default, marker_run ...)
+  run_olmocr_bench.py run     D NAME [pdf2md flags...]   # convert with the installed pdf2md (set PDF2MD to its path)
+  run_olmocr_bench.py engine  D NAME ENGINE [KEY=VAL..]  # convert with engines/ENGINE.py (any adapter in engines/)
   run_olmocr_bench.py score   D NAME                     # official scorer -> D/../NAME.summary.txt and NAME.fails.txt
   run_olmocr_bench.py compare D NAME [NAME ...]          # table: per-category score and time, side by side
 
-A candidate is a folder inside D holding <category>/<pdf_stem>_pg1_repeat1.md files. For pdf_to_md output the
+A candidate is a folder inside D holding <category>/<pdf_stem>_pg1_repeat1.md files. For pdf2md output the
 YAML frontmatter is stripped before scoring so provenance metadata is not scored as page content. Timings are
 written to D/NAME.times.json.
 """
@@ -31,7 +31,7 @@ BASE = "https://huggingface.co/datasets/allenai/olmOCR-bench/resolve/main/bench_
 SUBSET = {"arxiv_math": 12, "table_tests": 6, "multi_column": 6, "headers_footers": 4,   # the first four: as before
           "old_scans": 6, "old_scans_math": 6, "long_tiny_text": 6}                      # added for all 8 categories
 HERE = Path(__file__).resolve().parent
-TOOL = HERE.parent / "pdf_to_md.py"
+PDF2MD = os.environ.get("PDF2MD", "pdf2md")   # the installed command (uv tool install .)
 PY = os.environ.get("OLMBENCH_PYTHON", "/tmp/olmbench/env/bin/python")
 
 
@@ -75,7 +75,7 @@ def run(data: Path, name: str, flags: list[str]) -> None:
             continue
         out.parent.mkdir(parents=True, exist_ok=True)
         t = time.time()
-        r = subprocess.run(["uv", "run", "--python", "3.12", str(TOOL), str(pdf), "-o", str(out), "--no-backup", *flags],
+        r = subprocess.run([PDF2MD, str(pdf), "-o", str(out), "--no-backup", *flags],
                            capture_output=True, text=True)
         if r.returncode != 0 or not out.exists():
             print(f"[{i}/{len(pdfs)}] FAILED {pdf.name}: {r.stderr[-300:]}", flush=True)

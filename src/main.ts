@@ -10,43 +10,33 @@ import {
 	TAbstractFile,
 	TFile,
 	TFolder,
-	requestUrl,
 } from "obsidian";
 import { ChildProcess, execFile, spawn } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import toolSource from "../tool/pdf_to_md.py";
-import workerSource from "../tool/paddle_worker.py";
-import serveSource from "../tool/serve-paddleocr-vl.sh";
 import {
-	Api,
-	CleanMode,
 	DEFAULT_SETTINGS,
-	InlineMode,
 	PageLinks,
 	ProgressState,
 	Settings,
-	Engine,
-	apiBase,
 	etaLabel,
 	formatDuration,
 	fractionOverall,
 	initialState,
 	buildArgs,
-	clampInt,
+	migrateSettings,
 	noteToOpen,
+	parseCheck,
 	parseLine,
 	reduce,
+	setupProblem,
 	statusBarText,
 	toVaultPath,
 	toolEnv,
 	validPages,
 } from "./runner";
 
-const SCRIPT_NAME = "pdf_to_md.py";
-const WORKER_NAME = "paddle_worker.py";
-const SERVE_NAME = "serve-paddleocr-vl.sh";
 const MAX_LOG_LINES = 3000;
 
 const isPdf = (f: TAbstractFile): f is TFile => f instanceof TFile && f.extension.toLowerCase() === "pdf";
@@ -124,6 +114,11 @@ export default class Pdf2MdPlugin extends Plugin {
 			callback: () => this.showProgress(),
 		});
 		this.addCommand({
+			id: "check-setup",
+			name: "Check the pdf2md setup",
+			callback: () => void this.checkSetup(true),
+		});
+		this.addCommand({
 			id: "show-log",
 			name: "Show the last PDF conversion log",
 			callback: () => new LogModal(this.app, this.log.join("\n") || "No conversion has run yet.").open(),
@@ -134,7 +129,7 @@ export default class Pdf2MdPlugin extends Plugin {
 				if (isPdf(file)) {
 					menu.addItem((item) =>
 						item
-							.setTitle("Convert to Markdown (Docling + local model)")
+							.setTitle("Convert to Markdown (pdf2md-local)")
 							.setIcon("file-text")
 							.onClick(() => this.convertOne(file)),
 					);
@@ -166,7 +161,6 @@ export default class Pdf2MdPlugin extends Plugin {
 		);
 
 		this.addSettingTab(new Pdf2MdSettingTab(this.app, this));
-		await this.installScript();
 	}
 
 	onunload() {
@@ -174,20 +168,11 @@ export default class Pdf2MdPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		this.settings = migrateSettings(await this.loadData());
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
-	}
-
-	// ---- bundled tool ------------------------------------------------------------------------
-
-	/** Absolute path of the bundled model-server script, for the settings page. */
-	serveScriptPath(): string | null {
-		const base = this.basePath();
-		const dir = this.manifest.dir;
-		return base && dir ? path.join(base, dir, SERVE_NAME) : null;
 	}
 
 	private basePath(): string | null {
@@ -195,92 +180,42 @@ export default class Pdf2MdPlugin extends Plugin {
 		return a instanceof FileSystemAdapter ? a.getBasePath() : null;
 	}
 
-	/** Write the bundled Python tool (and its PaddleOCR-VL worker) into the plugin folder; updated with the plugin. */
-	private async installScript(): Promise<string | null> {
-		const base = this.basePath();
-		const dir = this.manifest.dir;
-		if (!base || !dir) return null;
-		const adapter = this.app.vault.adapter;
-		try {
-			for (const [name, source] of [[SCRIPT_NAME, toolSource], [WORKER_NAME, workerSource], [SERVE_NAME, serveSource]]) {
-				const rel = `${dir}/${name}`;
-				if (!(await adapter.exists(rel)) || (await adapter.read(rel)) !== source) await adapter.write(rel, source);
-			}
-			try {
-				fs.chmodSync(path.join(base, dir, SERVE_NAME), 0o755);
-			} catch {
-				// not fatal: the start command runs it through bash
-			}
-		} catch (e) {
-			new Notice(`PDF to Markdown: could not install the tool (${(e as Error).message})`);
-			return null;
-		}
-		return path.join(base, dir, SCRIPT_NAME);
-	}
-
 	// ---- checks before running ---------------------------------------------------------------
 
 	private env() {
-		return toolEnv(process.env, os.homedir(), this.settings.apiKey, path.delimiter);
+		return toolEnv(process.env, os.homedir(), path.delimiter);
 	}
 
-	/** Is a model server reachable, and (for Ollama) does it have the models we need? Shows a notice if not. */
-	private async checkServer(api: Api, host: string, models: string[]): Promise<boolean> {
-		const fail = (msg: string) => {
-			new Notice(`PDF to Markdown: ${msg}`, 12000);
-			return false;
-		};
-		const key = this.settings.apiKey.trim();
-		try {
-			if (api === "ollama") {
-				const res = await requestUrl({ url: `${host.replace(/\/+$/, "")}/api/tags` });
-				const names: string[] = (res.json?.models ?? []).map((m: { name: string }) => m.name);
-				const missing = models.filter((w) => w && !names.includes(w) && !names.includes(`${w}:latest`));
-				if (missing.length) return fail(`Ollama is missing "${missing[0]}". Run: ollama pull ${missing[0]}`);
-			} else {
-				// any HTTP answer means the server is up; some servers do not implement /models
-				await requestUrl({
-					url: `${apiBase(host)}/models`,
-					throw: false,
-					headers: key ? { Authorization: `Bearer ${key}` } : {},
-				});
-			}
-		} catch {
-			return fail(
-				api === "ollama"
-					? `cannot reach Ollama at ${host}. Start it with "ollama serve", or turn off "Use a model server" in the settings.`
-					: `cannot reach the model server at ${apiBase(host)}. Start it first, for example: llama-server -m model.gguf --mmproj mmproj.gguf --port 8080`,
-			);
-		}
-		return true;
-	}
-
-	private async preflight(): Promise<boolean> {
+	/**
+	 * Ask the installed `pdf2md` whether it is ready. The plugin never installs or downloads anything: when something
+	 * is missing it only says which terminal command to run.
+	 */
+	async checkSetup(verbose = false): Promise<boolean> {
 		const s = this.settings;
-		const uvOk = await new Promise<boolean>((resolve) =>
-			execFile(s.uvPath, ["--version"], { env: this.env() }, (err) => resolve(!err)),
+		const out = await new Promise<{ err: Error | null; stdout: string }>((resolve) =>
+			execFile(s.pdf2mdPath, ["check", "--json", "--server", s.paddleServer], { env: this.env(), timeout: 60000 },
+				(err, stdout) => resolve({ err, stdout: String(stdout) })),
 		);
-		if (!uvOk) {
+		const check = parseCheck(out.stdout);
+		if (!check) {
 			new Notice(
-				`PDF to Markdown: could not run "${s.uvPath}". Install uv (https://docs.astral.sh/uv/) ` +
-					`or set its full path in the plugin settings.`,
-				12000,
+				`PDF to Markdown: could not run "${s.pdf2mdPath}". Install it in a terminal (uv tool install pdf2md-local, then ` +
+					`pdf2md setup), or set its full path in the plugin settings.`,
+				15000,
 			);
 			return false;
 		}
-		if (s.engine === "paddleocr-vl") {
-			// with a start command the tool launches the server itself; otherwise it must already be running
-			if (s.serveCommand.trim()) return true;
-			return this.checkServer("openai", s.paddleServer.trim() || DEFAULT_SETTINGS.paddleServer, []);
+		const problem = setupProblem(check, s.serveCommand.trim() !== "");
+		if (problem) {
+			new Notice(`PDF to Markdown: ${problem}`, 15000);
+			return false;
 		}
-		if (!s.useLlm) return true;
-		const needText = s.cleanMode !== "none";
-		const vApi: Api = s.visionApi || s.api;
-		const vHost = s.visionHost.trim() || s.ollamaHost;
-		if (needText && !(await this.checkServer(s.api, s.ollamaHost, [s.textModel]))) return false;
-		if (s.useVision) {
-			const vModel = s.visionModel.trim() || s.textModel;
-			if (!(await this.checkServer(vApi, vHost, [vModel]))) return false;
+		if (verbose) {
+			const server = check.checks.find((c) => c.id === "server");
+			new Notice(
+				"PDF to Markdown: ready." + (server?.ok ? "" : " The model server is not running; it is started for each conversion."),
+				8000,
+			);
 		}
 		return true;
 	}
@@ -307,9 +242,7 @@ export default class Pdf2MdPlugin extends Plugin {
 			return;
 		}
 		if (!files.length) return;
-		if (!(await this.preflight())) return;
-		const script = await this.installScript();
-		if (!script) return;
+		if (!(await this.checkSetup())) return;
 
 		let outAbs: string | undefined;
 		const folder = this.settings.outputFolder.trim().replace(/^\/+|\/+$/g, "");
@@ -318,15 +251,14 @@ export default class Pdf2MdPlugin extends Plugin {
 			fs.mkdirSync(outAbs, { recursive: true });
 		}
 		const args = buildArgs(
-			script,
 			files.map((f) => path.join(base, f.path)),
 			this.settings,
 			outAbs,
 			files.length === 1 ? pages : undefined,
 		);
 
-		this.log = [`$ ${this.settings.uvPath} ${args.join(" ")}`];
-		const proc = spawn(this.settings.uvPath, args, {
+		this.log = [`$ ${this.settings.pdf2mdPath} ${args.join(" ")}`];
+		const proc = spawn(this.settings.pdf2mdPath, args, {
 			cwd: base,
 			env: this.env(),
 			detached: process.platform !== "win32",
@@ -721,100 +653,40 @@ class Pdf2MdSettingTab extends PluginSettingTab {
 
 		containerEl.createEl("p", {
 			text:
-				"Converts PDFs to Obsidian Markdown on this computer with Docling and a local vision model. " +
-				"Nothing is sent to any online service unless you point it at one. Requires uv and a model server.",
+				"Converts PDFs to Markdown on this computer with the pdf2md command-line tool (PaddleOCR-VL through llama.cpp). " +
+				"Nothing is uploaded. The plugin does not install anything: set the tool up once in a terminal (see the README), then check it here.",
 		});
+		new Setting(containerEl).setName("Setup").setHeading();
+		new Setting(containerEl).setName("Check the setup")
+			.setDesc("Runs pdf2md check and reports what is missing, with the terminal command that fixes it.")
+			.addButton((b) => b.setButtonText("Check").onClick(() => void this.plugin.checkSetup(true)));
+		new Setting(containerEl).setName("pdf2md command").setDesc("Name or full path of the pdf2md executable.")
+			.addText((t) => t.setValue(s.pdf2mdPath).onChange(async (v) => { s.pdf2mdPath = v.trim() || DEFAULT_SETTINGS.pdf2mdPath; await save(); }));
 
-		new Setting(containerEl).setName("Engine").setHeading();
-		new Setting(containerEl).setName("Conversion engine")
-			.setDesc("PaddleOCR-VL-1.6 reads whole pages (layout, text, maths, tables) with a small model served by llama.cpp, no Ollama: best on maths and light on memory in my tests, weaker on tables and old scans. Docling + a vision model uses Ollama or any OpenAI-compatible server and is better on tables and headers/footers.")
-			.addDropdown((d) => d.addOptions({ docling: "Docling + vision model", "paddleocr-vl": "PaddleOCR-VL-1.6 (llama.cpp)" })
-				.setValue(s.engine).onChange(async (v) => { s.engine = v as Engine; await save(); this.display(); }));
-
-		if (s.engine === "paddleocr-vl") {
-			new Setting(containerEl).setName("PaddleOCR-VL server").setHeading();
-			new Setting(containerEl).setName("Page resolution")
-				.setDesc("Balanced: 180 dpi. High resolution: 288 dpi, better on tables in the small test set but not consistently better on other pages.")
-				.addDropdown((d) => d.addOptions({ "2.5": "Balanced (180 dpi)", "4": "Tables (288 dpi)" })
-					.setValue(String(s.paddleScale)).onChange(async (v) => { s.paddleScale = Number(v); await save(); }));
-			containerEl.createEl("p", {
-				text: "Runs the PaddleOCR-VL-1.6 model with llama.cpp's llama-server. The plugin folder contains serve-paddleocr-vl.sh in the project's tool folder to download the model and start the server; see the README.",
-			});
-			new Setting(containerEl).setName("Server address").setDesc("Where llama-server listens. Default: http://127.0.0.1:8111/v1")
-				.addText((t) => t.setValue(s.paddleServer).onChange(async (v) => { s.paddleServer = v.trim() || DEFAULT_SETTINGS.paddleServer; await save(); }));
-			new Setting(containerEl).setName("Start command").setDesc("Optional. If nothing answers at that address, this command is run first and stopped when the conversion ends. The bundled script downloads the model on first use and needs llama-server on your PATH (or LLAMA_SERVER set).")
-				.addText((t) => t.setValue(s.serveCommand).onChange(async (v) => { s.serveCommand = v; await save(); }))
-				.addButton((b) => b.setButtonText("Use bundled script").onClick(async () => {
-					const script = this.plugin.serveScriptPath();
-					if (!script) return;
-					s.serveCommand = `bash "${script}"`;
-					await save();
-					this.display();
-				}));
-		} else {
-			this.modelSettings(containerEl);
-		}
-		this.outputSettings(containerEl);
-	}
-
-	private modelSettings(containerEl: HTMLElement): void {
-		const s = this.plugin.settings;
-		const save = async () => this.plugin.saveSettings();
 		new Setting(containerEl).setName("Model server").setHeading();
-		new Setting(containerEl).setName("Use a model server").setDesc("Off = Docling only: no equation re-reading, no inline maths, no captions.")
-			.addToggle((t) => t.setValue(s.useLlm).onChange(async (v) => { s.useLlm = v; await save(); }));
-		new Setting(containerEl).setName("Server type").setDesc("Ollama, or any OpenAI-compatible server such as llama.cpp's llama-server, LM Studio or vLLM.")
-			.addDropdown((d) => d.addOptions({ ollama: "Ollama", openai: "OpenAI-compatible" }).setValue(s.api).onChange(async (v) => { s.api = v as Api; await save(); }));
-		new Setting(containerEl).setName("Server address").setDesc("Ollama: http://localhost:11434. llama-server: http://localhost:8080")
-			.addText((t) => t.setValue(s.ollamaHost).onChange(async (v) => { s.ollamaHost = v.trim() || DEFAULT_SETTINGS.ollamaHost; await save(); }));
-		new Setting(containerEl).setName("API key").setDesc("Only if the server needs one. Stored in this plugin's data file in your vault; sent to the tool through the environment, not the command line.")
-			.addText((t) => { t.inputEl.type = "password"; t.setValue(s.apiKey).onChange(async (v) => { s.apiKey = v; await save(); }); });
-		new Setting(containerEl).setName("Text model").setDesc("Used only for prose cleanup. For Ollama, pull it first, e.g. ollama pull gemma4:12b")
-			.addText((t) => t.setValue(s.textModel).onChange(async (v) => { s.textModel = v.trim() || DEFAULT_SETTINGS.textModel; await save(); }));
+		new Setting(containerEl).setName("Page resolution")
+			.setDesc("Balanced: 180 dpi (recommended). High resolution: 288 dpi, for table-heavy PDFs.")
+			.addDropdown((d) => d.addOptions({ "2.5": "Balanced (180 dpi)", "4": "Tables (288 dpi)" })
+				.setValue(String(s.paddleScale)).onChange(async (v) => { s.paddleScale = Number(v); await save(); }));
+		new Setting(containerEl).setName("Server address").setDesc("Where llama-server listens. Default: http://127.0.0.1:8111/v1")
+			.addText((t) => t.setValue(s.paddleServer).onChange(async (v) => { s.paddleServer = v.trim() || DEFAULT_SETTINGS.paddleServer; await save(); }));
+		new Setting(containerEl).setName("Start command").setDesc("Run only if nothing answers at that address, and stopped when the conversion ends. Empty = pdf2md serve, which needs llama-server on your PATH.")
+			.addText((t) => t.setPlaceholder("pdf2md serve").setValue(s.serveCommand).onChange(async (v) => { s.serveCommand = v; await save(); }));
 
-		new Setting(containerEl).setName("Vision").setHeading();
-		new Setting(containerEl).setName("Use vision").setDesc("Re-read equations, rewrite maths paragraphs as LaTeX and (with a chat model) caption figures.")
-			.addToggle((t) => t.setValue(s.useVision).onChange(async (v) => { s.useVision = v; await save(); }));
-		new Setting(containerEl).setName("Vision model").setDesc("Empty = same as the text model. For llama-server any name works.")
-			.addText((t) => t.setValue(s.visionModel).onChange(async (v) => { s.visionModel = v.trim(); await save(); }));
-		new Setting(containerEl).setName("Vision server type").setDesc("Only if the vision model runs on a different kind of server than the text model.")
-			.addDropdown((d) => d.addOptions({ "": "Same as above", ollama: "Ollama", openai: "OpenAI-compatible" }).setValue(s.visionApi).onChange(async (v) => { s.visionApi = v as "" | Api; await save(); }));
-		new Setting(containerEl).setName("Vision server address").setDesc("Empty = same address as above.")
-			.addText((t) => t.setValue(s.visionHost).onChange(async (v) => { s.visionHost = v.trim(); await save(); }));
-		new Setting(containerEl).setName("Parallel requests").setDesc("3 is the sweet spot on one GPU. For Ollama keep it at or below OLLAMA_NUM_PARALLEL.")
-			.addText((t) => t.setValue(String(s.jobs)).onChange(async (v) => { s.jobs = clampInt(Number(v), 1, 16); await save(); }));
-
-	}
-
-	private outputSettings(containerEl: HTMLElement): void {
-		const s = this.plugin.settings;
-		const save = async () => this.plugin.saveSettings();
 		new Setting(containerEl).setName("Output").setHeading();
 		new Setting(containerEl).setName("Split books into chapters").setDesc("Writes a folder with an index, front matter, one note per chapter and back matter. Needs numbered chapter headings; otherwise one note is written.")
 			.addToggle((t) => t.setValue(s.splitChapters).onChange(async (v) => { s.splitChapters = v; await save(); }));
 		new Setting(containerEl).setName("Output folder").setDesc("Vault-relative folder. Empty = next to the PDF.")
 			.addText((t) => t.setPlaceholder("e.g. Imports").setValue(s.outputFolder).onChange(async (v) => { s.outputFolder = v; await save(); }));
-		new Setting(containerEl).setName("Links to PDF pages").setDesc("Adds [[file.pdf#page=N]] under each heading. Auto = when the PDF is in your vault.")
+		new Setting(containerEl).setName("Links to PDF pages").setDesc("Adds [[file.pdf#page=N]] under each heading. Auto = on.")
 			.addDropdown((d) => d.addOptions({ auto: "auto", on: "always", off: "never" }).setValue(s.pageLinks).onChange(async (v) => { s.pageLinks = v as PageLinks; await save(); }));
-		new Setting(containerEl).setName("Flag equations that look cut off").setDesc("Adds a collapsed callout with the source picture under an equation that may be incomplete.")
-			.addToggle((t) => t.setValue(s.equationFlags).onChange(async (v) => { s.equationFlags = v; await save(); }));
 		new Setting(containerEl).setName("Show a progress window").setDesc("Opens when a conversion starts, with a progress bar and the time left. Close it to keep working: the conversion continues, and clicking the status bar reopens it.")
 			.addToggle((t) => t.setValue(s.progressWindow).onChange(async (v) => { s.progressWindow = v; await save(); }));
 		new Setting(containerEl).setName("Ask which pages to convert").setDesc("Prompt for a page range before every single-PDF conversion. The command \"Convert PDF pages…\" always asks.")
 			.addToggle((t) => t.setValue(s.askForPages).onChange(async (v) => { s.askForPages = v; await save(); }));
 
 		new Setting(containerEl).setName("Advanced").setHeading();
-		if (s.engine !== "paddleocr-vl") {
-			new Setting(containerEl).setName("Prose cleanup").setDesc("auto = only chunks that show extraction damage (recommended).")
-				.addDropdown((d) => d.addOptions({ auto: "auto", all: "all", none: "none" }).setValue(s.cleanMode).onChange(async (v) => { s.cleanMode = v as CleanMode; await save(); }));
-			new Setting(containerEl).setName("Inline maths").setDesc("auto = paragraphs that look mathematical; all = every paragraph (slower, no better in tests).")
-				.addDropdown((d) => d.addOptions({ auto: "auto", all: "all", off: "off" }).setValue(s.inlineMath).onChange(async (v) => { s.inlineMath = v as InlineMode; await save(); }));
-			new Setting(containerEl).setName("Pages per slice").setDesc("Big PDFs are converted in slices of this many pages to bound memory. 0 = whole file.")
-				.addText((t) => t.setValue(String(s.pagesPerBatch)).onChange(async (v) => { s.pagesPerBatch = clampInt(Number(v), 0, 500); await save(); }));
-		}
-		new Setting(containerEl).setName("uv executable").setDesc("Name or full path of uv.")
-			.addText((t) => t.setValue(s.uvPath).onChange(async (v) => { s.uvPath = v.trim() || "uv"; await save(); }));
-		new Setting(containerEl).setName("Extra arguments").setDesc("Passed straight to the tool, e.g. --no-ocr")
+		new Setting(containerEl).setName("Extra arguments").setDesc("Passed straight to pdf2md, e.g. --no-cache")
 			.addText((t) => t.setValue(s.extraArgs).onChange(async (v) => { s.extraArgs = v; await save(); }));
 	}
 }

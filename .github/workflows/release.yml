@@ -25,6 +25,12 @@ jobs:
       - run: npm test
       - name: The tag must match manifest.json
         run: test "$(node -p "require('./manifest.json').version")" = "${GITHUB_REF_NAME}"
+      - name: versions must agree (manifest, package.json, pyproject, versions.json)
+        run: |
+          v="$(node -p "require('./manifest.json').version")"
+          test "$(node -p "require('./package.json').version")" = "$v"
+          grep -q "^version = \"$v\"" pyproject.toml
+          node -e "process.exit(require('./versions.json')['$v'] ? 0 : 1)"
       - name: Publish the release assets Obsidian needs
         env:
           GH_TOKEN: ${{ github.token }}
