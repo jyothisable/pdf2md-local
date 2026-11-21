@@ -69,6 +69,9 @@ reopens it.
 - It reads the selected PDFs from your vault and writes new notes and images into your vault (or the output folder you set).
 - No telemetry, ads or accounts. The only network traffic is to the model server address you configure
   (default `127.0.0.1`); `pdf2md setup` downloads packages and the model once, when you run it in a terminal.
+- **Files outside the vault:** the `pdf2md` tool keeps its worker environment in `~/.local/share/pdf2md-local`,
+  model files in `~/.cache/pdf2md/models`, and temporary checkpoints in `~/.cache/pdf2md` (removed after a successful
+  run), and writes the model server log to your system temp folder. It reads and writes nothing else outside the vault.
 - Settings are stored in the plugin's `data.json`; no secrets are involved.
 
 ## Current benchmark

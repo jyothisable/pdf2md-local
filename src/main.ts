@@ -10,9 +10,9 @@ import {
 	TAbstractFile,
 	TFile,
 	TFolder,
+	normalizePath,
 } from "obsidian";
 import { ChildProcess, execFile, spawn } from "child_process";
-import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import {
@@ -168,7 +168,7 @@ export default class Pdf2MdPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		this.settings = migrateSettings(await this.loadData());
+		this.settings = migrateSettings((await this.loadData()) as Record<string, unknown> | null);
 	}
 
 	async saveSettings() {
@@ -245,10 +245,15 @@ export default class Pdf2MdPlugin extends Plugin {
 		if (!(await this.checkSetup())) return;
 
 		let outAbs: string | undefined;
-		const folder = this.settings.outputFolder.trim().replace(/^\/+|\/+$/g, "");
-		if (folder) {
+		const raw = this.settings.outputFolder.trim();
+		if (raw) {
+			const folder = normalizePath(raw);
+			if (folder.split("/").includes("..") || path.isAbsolute(raw)) {
+				new Notice("PDF to Markdown: the output folder must be a folder inside the vault.", 10000);
+				return;
+			}
+			if (!this.app.vault.getFolderByPath(folder)) await this.app.vault.createFolder(folder);
 			outAbs = path.join(base, folder);
-			fs.mkdirSync(outAbs, { recursive: true });
 		}
 		const args = buildArgs(
 			files.map((f) => path.join(base, f.path)),
@@ -374,7 +379,7 @@ export default class Pdf2MdPlugin extends Plugin {
 				await this.app.workspace.getLeaf(false).openFile(f);
 				return;
 			}
-			await new Promise((r) => setTimeout(r, 500));
+			await new Promise((r) => window.setTimeout(r, 500));
 		}
 	}
 
@@ -594,7 +599,7 @@ class ProgressModal extends Modal {
 		const bar = el.createDiv({ cls: "pdf2md-bar-outer" });
 		const inner = bar.createDiv({ cls: "pdf2md-bar-inner" });
 		if (v.running && s.pagesTotal === 0) inner.addClass("is-indeterminate");
-		else inner.style.width = `${pct}%`;
+		else inner.setCssProps({ "--pdf2md-pct": `${pct}%` });
 		if (failed) inner.addClass("is-failed");
 
 		const pages = s.pagesTotal > 0 ? `Page ${Math.min(s.pagesDone, s.pagesTotal)} of ${s.pagesTotal}` : "Preparing…";
@@ -663,7 +668,6 @@ class Pdf2MdSettingTab extends PluginSettingTab {
 				"Converts PDFs to Markdown on this computer with the pdf2md command-line tool (PaddleOCR-VL through llama.cpp). " +
 				"Nothing is uploaded. The plugin does not install anything: set the tool up once in a terminal (see the README), then check it here.",
 		});
-		new Setting(containerEl).setName("Setup").setHeading();
 		new Setting(containerEl).setName("Check the setup")
 			.setDesc("Runs pdf2md check and reports what is missing, with the terminal command that fixes it.")
 			.addButton((b) => b.setButtonText("Check").onClick(() => void this.plugin.checkSetup(true)));

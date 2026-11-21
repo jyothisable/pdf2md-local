@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.3
+
+- Policy self-check with `eslint-plugin-obsidianmd`: type-safe parsing of the setup report, window timers, no inline styles, and no top-level settings heading.
+- The output folder is created through the Obsidian API, normalised, and must stay inside the vault (`..` and absolute paths are rejected).
+- `minAppVersion` is 1.5.7 (the oldest version with every API the plugin uses).
+- README lists the files the tool touches outside the vault.
+
 ## 0.4.2
 
 - Progress window: the Details section stays open (and keeps its scroll position) while the view refreshes.

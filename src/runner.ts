@@ -105,9 +105,9 @@ export interface SetupCheck {
 /** Parse `pdf2md check --json`; null if the output is not what the tool prints. */
 export function parseCheck(text: string): { ready: boolean; checks: SetupCheck[] } | null {
 	try {
-		const d = JSON.parse(text);
+		const d = JSON.parse(text) as { ready?: unknown; checks?: unknown } | null;
 		if (typeof d?.ready !== "boolean" || !Array.isArray(d.checks)) return null;
-		return d;
+		return { ready: d.ready, checks: d.checks as SetupCheck[] };
 	} catch {
 		return null;
 	}
