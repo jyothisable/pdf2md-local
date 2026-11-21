@@ -6,6 +6,19 @@ online service unless you point it at one.
 
 It ships as an Obsidian plugin and as a standalone command-line tool (`pdf2md`), with two interchangeable engines.
 
+## Maths and science books → a linked Obsidian library
+
+**Well-suited to local extraction of maths-heavy and science books**, with positive sample results on two
+mathematical/deep-learning textbooks. It preserves equations, scientific figures and tables, and can **split a
+whole book into chapter notes** with a linked contents page and Previous / Contents / Next navigation. PDF
+bookmarks guide chapter titles and section hierarchy when available; source-page links let you check the original.
+
+Use **2.5 Balanced** as the default. The source-backed version scored **79.6% overall**, versus 80.2% before the
+safeguards—a **0.6-percentage-point reduction**, within the selected one-point acceptance limit. It passed 91.2%
+of the arXiv-maths checks. The book sample review covered 33 pages, not every page or every scientific discipline:
+review equations you rely on. Uncertain formulas may be retained as faithful source images rather than editable
+LaTeX. See the benchmark and source-fidelity sections below for the full evidence and limitations.
+
 ## Why choose it for a local 8–16 GB GPU?
 
 **A strong fit for private, maths-heavy reading—not a claim to be the best parser for every document.**
